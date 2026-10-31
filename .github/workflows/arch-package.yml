@@ -1,0 +1,116 @@
+name: Arch package
+
+on:
+  workflow_run:
+    workflows: [Sync upstream]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arch-release-package
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the synchronized fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find the latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(gh api repos/chromasystemprofessional/Zac-OS-9/releases/latest)
+          tag=$(jq -r .tag_name <<<"$release")
+          version=${tag#v}
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Unexpected upstream release tag: $tag" >&2
+            exit 1
+          fi
+          git fetch https://github.com/chromasystemprofessional/Zac-OS-9.git \
+            "refs/tags/$tag:refs/tags/upstream-$tag"
+          git push origin "refs/tags/upstream-$tag:refs/tags/$tag"
+          release_source=$(git rev-parse "refs/tags/upstream-$tag^")
+          if ! git merge-base --is-ancestor "$release_source" HEAD; then
+            echo "The source commit for upstream release $tag is not in the fork's synchronized main yet;" \
+              "the next sync run will retry."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          asset="archintosh-os-9-${version}-1-x86_64.pkg.tar.zst"
+          if release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2>/dev/null); then
+            if jq -e --arg asset "$asset" '.assets | any(.name == $asset)' \
+                <<<"$release_json" >/dev/null; then
+              echo "Arch package for $tag is already attached."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build packages in a clean Arch environment
+        if: steps.release.outputs.ready == 'true'
+        env:
+          ARCHINTOSH_VERSION: ${{ steps.release.outputs.version }}
+          ARCHINTOSH_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          mkdir -p ci-artifacts
+          docker run --rm \
+            -e ARCHINTOSH_VERSION \
+            -e ARCHINTOSH_COMMIT \
+            -v "$GITHUB_WORKSPACE:/work" \
+            archlinux:base-devel bash -euo pipefail -c '
+              pacman -Syu --noconfirm
+              pacman -S --needed --noconfirm sudo git
+              useradd --create-home builder
+              printf "builder ALL=(ALL:ALL) NOPASSWD: ALL\n" > /etc/sudoers.d/builder
+              chmod 0440 /etc/sudoers.d/builder
+              mkdir -p /work/ci-artifacts /tmp/pkg-wlroots /tmp/pkg-archintosh
+              chown -R builder:builder /work/ci-artifacts /tmp/pkg-wlroots /tmp/pkg-archintosh
+
+              cp -a /work/packaging/arch/wlroots0.18/. /tmp/pkg-wlroots/
+              cd /tmp/pkg-wlroots
+              sudo -u builder env PKGDEST=/work/ci-artifacts makepkg --syncdeps --noconfirm --cleanbuild
+              sudo pacman -U --noconfirm /work/ci-artifacts/wlroots0.18-*.pkg.tar.zst
+
+              cp -a /work/packaging/arch/PKGBUILD \
+                /work/packaging/arch/fontconfig-freetype-header.patch /tmp/pkg-archintosh/
+              cd /tmp/pkg-archintosh
+              sudo -u builder env PKGDEST=/work/ci-artifacts \
+                ARCHINTOSH_VERSION="$ARCHINTOSH_VERSION" \
+                ARCHINTOSH_COMMIT="$ARCHINTOSH_COMMIT" \
+                makepkg --syncdeps --noconfirm --cleanbuild
+            '
+          cd ci-artifacts
+          sha256sum archintosh-os-9-*.pkg.tar.zst > SHA256SUMS
+
+      - name: Publish package on the fork release
+        if: steps.release.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "Archintosh OS 9 $RELEASE_TAG" \
+              --notes "Arch Linux x86_64 package built from the synchronized Archintosh fork for upstream ZacOS 9 release $RELEASE_TAG."
+          fi
+          gh release upload "$RELEASE_TAG" \
+            ci-artifacts/archintosh-os-9-*.pkg.tar.zst \
+            ci-artifacts/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY"

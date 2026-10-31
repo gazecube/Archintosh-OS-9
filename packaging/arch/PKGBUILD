@@ -1,0 +1,61 @@
+# Maintainer: gazecube
+pkgname=archintosh-os-9
+pkgver="${ARCHINTOSH_VERSION:-1.6.2}"
+pkgrel=1
+pkgdesc='Classic Platinum desktop for Wayland, styled after Mac OS 9'
+arch=('x86_64')
+url='https://github.com/gazecube/Archintosh-OS-9'
+license=('GPL-3.0-or-later')
+provides=('zacos9')
+conflicts=('zacos9')
+depends=(
+  accountsservice appstream avahi bluez bluez-utils cups dosfstools earlyoom
+  flatpak fontconfig freetype2 fuse3 gdk-pixbuf2 glib2 gsettings-desktop-schemas
+  gst-plugins-base gst-plugins-good gtk3 harfbuzz imagemagick layer-shell-qt
+  libarchive libcap libdbusmenu-glib libdrm libgcrypt libinput libsecret
+  libxcrypt malcontent networkmanager ntfs-3g os-prober pam pipewire procps-ng
+  python python-gobject python-libarchive-c python-pillow qt6-base qt6-imageformats
+  qt6-svg qt6-wayland rsync slurp systemd unarchiver upower udisks2 wayland
+  wlroots0.18 xdg-desktop-portal xdg-desktop-portal-wlr xorg-xwayland zlib
+)
+makedepends=(
+  appmenu-gtk-module base-devel cmake layer-shell-qt meson ninja pkgconf
+  python-fonttools wayland-protocols
+)
+optdepends=(
+  'greetd: OS 9-style login manager'
+  'grim: desktop screenshots and screen sharing'
+  'pipewire-audio: audio playback and recording'
+  'wireplumber: PipeWire session management'
+  'wl-clipboard: clipboard integration'
+  'xdg-desktop-portal-gtk: native file chooser portal'
+)
+if [[ -n "${ARCHINTOSH_COMMIT:-}" ]]; then
+  source=("${pkgname}::git+https://github.com/gazecube/Archintosh-OS-9.git#commit=${ARCHINTOSH_COMMIT}")
+else
+  source=("${pkgname}::git+https://github.com/gazecube/Archintosh-OS-9.git#branch=main")
+fi
+source+=(fontconfig-freetype-header.patch)
+sha256sums=('SKIP' 'c753ec53bfdada885ed2c91338477d60a552135ffaed956e09b982146b04a267')
+
+prepare() {
+  cd "${srcdir}/${pkgname}"
+  if ! grep -q '^#include <fontconfig/fcfreetype.h>' shell/files/fonts.cpp; then
+    patch -Np1 -i "${srcdir}/fontconfig-freetype-header.patch"
+  fi
+}
+
+build() {
+  arch-meson "${srcdir}/${pkgname}" build \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --libexecdir=lib/zacos9 \\
+    -Darch_package=true
+  meson compile -C build
+}
+
+package() {
+  DESTDIR="${pkgdir}" meson install -C build
+  install -Dm644 "${srcdir}/${pkgname}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

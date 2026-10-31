@@ -1,0 +1,2 @@
+option('arch_package', type: 'boolean', value: false,
+  description: 'Build Software Update for Arch Linux packages')

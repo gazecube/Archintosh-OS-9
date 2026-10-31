@@ -8,7 +8,11 @@
 #include <QProcess>
 #include <QRegularExpression>
 
+#ifdef ZACOS9_ARCH_PACKAGE
+static const char DEFAULT_REPO[] = "gazecube/Archintosh-OS-9";
+#else
 static const char DEFAULT_REPO[] = "chromasystemprofessional/Zac-OS-9";
+#endif
 
 QString updateRepo() {
 	const QString env = qEnvironmentVariable("ZACOS9_UPDATE_REPO");
@@ -27,7 +31,7 @@ Release parseRelease(const QByteArray &json, const QString &arch) {
 	if (tag.startsWith('v') || tag.startsWith('V')) {
 		tag.remove(0, 1);
 	}
-	/* Only what Debian can call a version reaches dpkg and the window. */
+	/* Keep release tags safe for the package manager and the window. */
 	static const QRegularExpression versionRe("^[0-9][A-Za-z0-9.+~-]*$");
 	if (!versionRe.match(tag).hasMatch()) {
 		return r;
@@ -38,11 +42,17 @@ Release parseRelease(const QByteArray &json, const QString &arch) {
 		r.name = o.value("tag_name").toString();
 	}
 	r.notes = o.value("body").toString();
+#ifdef ZACOS9_ARCH_PACKAGE
+	const QString packagePrefix = "archintosh-os-9-" + r.version + "-";
+	const QString suffix = "-1-" + arch + ".pkg.tar.zst";
+#else
+	const QString packagePrefix = "zacos9_";
 	const QString suffix = "_" + arch + ".deb";
+#endif
 	for (const QJsonValue &v : o.value("assets").toArray()) {
 		const QJsonObject a = v.toObject();
 		const QString name = a.value("name").toString();
-		if (!name.startsWith("zacos9_") || !name.endsWith(suffix)) {
+		if (!name.startsWith(packagePrefix) || !name.endsWith(suffix)) {
 			continue;
 		}
 		const QString url = a.value("browser_download_url").toString();
@@ -93,9 +103,15 @@ bool versionNewer(const QString &a, const QString &b) {
 	if (b.isEmpty()) {
 		return true;
 	}
+#ifdef ZACOS9_ARCH_PACKAGE
+	int code = -1;
+	const QString result = runQuiet("vercmp", { a, b }, &code);
+	return code == 0 && result.toInt() > 0;
+#else
 	int code = -1;
 	runQuiet("dpkg", { "--compare-versions", a, "gt", b }, &code);
 	return code == 0;
+#endif
 }
 
 QString debianCheckProblem(int refreshCode, int simulateCode, const QString &error) {
@@ -112,15 +128,25 @@ QString debianCheckProblem(int refreshCode, int simulateCode, const QString &err
 }
 
 QString installedVersion(const QString &package) {
+#ifdef ZACOS9_ARCH_PACKAGE
+	int code = -1;
+	const QString out = runQuiet("pacman", { "-Q", package }, &code);
+	return code == 0 ? out.section(' ', 1) : QString();
+#else
 	int code = -1;
 	const QString out = runQuiet("dpkg-query", { "-W", "-f=${Status}\t${Version}", package }, &code);
 	if (code != 0 || !out.startsWith("install ok installed\t")) {
 		return {};
 	}
 	return out.section('\t', 1);
+#endif
 }
 
 QString debArchitecture() {
+#ifdef ZACOS9_ARCH_PACKAGE
+	return QStringLiteral("x86_64");
+#else
 	const QString arch = runQuiet("dpkg", { "--print-architecture" });
 	return arch.isEmpty() ? QStringLiteral("amd64") : arch;
+#endif
 }

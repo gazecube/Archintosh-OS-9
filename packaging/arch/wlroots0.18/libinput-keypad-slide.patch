@@ -1,0 +1,12 @@
+diff --git a/backend/libinput/switch.c b/backend/libinput/switch.c
+--- a/backend/libinput/switch.c
++++ b/backend/libinput/switch.c
+@@ -36,5 +36,8 @@ void handle_switch_toggle(struct libinput_event *event,
+ 	case LIBINPUT_SWITCH_TABLET_MODE:
+ 		wlr_event.switch_type = WLR_SWITCH_TYPE_TABLET_MODE;
+ 		break;
++	case LIBINPUT_SWITCH_KEYPAD_SLIDE:
++		// wlroots 0.18 has no matching switch type; ignore this event.
++		return;
+ 	}
+ 	switch (libinput_event_switch_get_switch_state(sevent)) {

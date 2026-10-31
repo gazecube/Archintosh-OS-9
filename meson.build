@@ -12,6 +12,10 @@ add_project_arguments(
   language: 'c',
 )
 
+if get_option('arch_package')
+  add_project_arguments('-DZACOS9_ARCH_PACKAGE', language: 'cpp')
+endif
+
 # Tests must never draw on the desktop they are built from: a test that opened
 # windows on the live compositor once crashed it and logged the user out. Tests
 # that need a display start their own headless zacos9-wm and override these.

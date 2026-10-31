@@ -1,0 +1,10 @@
+--- a/shell/files/fonts.cpp
++++ b/shell/files/fonts.cpp
+@@ -17,6 +17,7 @@
+ #include <QTextBoundaryFinder>
+ #include <QSet>
+ #include <fontconfig/fontconfig.h>
++#include <fontconfig/fcfreetype.h>
+ #include <ft2build.h>
+ #include FT_FREETYPE_H
+ #include <hb-ft.h>

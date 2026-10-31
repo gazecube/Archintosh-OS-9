@@ -25,7 +25,11 @@ static constexpr int W = 420, H = 150;
 static constexpr int TEXT_X = 60, TEXT_W = W - TEXT_X - 14;
 static constexpr int BUTTON_W = 80;
 static constexpr uint32_t FACE = GRAY(0xD);
+#ifdef ZACOS9_ARCH_PACKAGE
+static const QString PACKAGE = QStringLiteral("archintosh-os-9");
+#else
 static const QString PACKAGE = QStringLiteral("zacos9");
+#endif
 
 UpdateWindow::UpdateWindow() {
 	setWindowTitle("Software Update");
@@ -166,12 +170,18 @@ void UpdateWindow::check() {
 	m_debian.clear();
 	m_debianProblem.clear();
 	m_current = installedVersion(PACKAGE);
+	setButtons(QString(), "Cancel");
+#ifdef ZACOS9_ARCH_PACKAGE
+	setText("Checking for updates…", "Looking for a new Archintosh OS 9 release.");
+	m_pendingChecks = 1;
+	checkGitHub();
+#else
 	setText("Checking for updates…", "Looking for a new version of ZacOS 9 and for updates "
 		"to the Debian software it runs on.");
-	setButtons(QString(), "Cancel");
 	m_pendingChecks = 2;
 	checkGitHub();
 	checkDebian();
+#endif
 }
 
 void UpdateWindow::checkGitHub() {
@@ -195,7 +205,11 @@ void UpdateWindow::checkGitHub() {
 		} else {
 			const Release r = parseRelease(reply->readAll(), debArchitecture());
 			if (!r.valid) {
+#ifdef ZACOS9_ARCH_PACKAGE
+				m_releaseError = "the newest release has no Archintosh package for this computer";
+#else
 				m_releaseError = "the newest release has no ZacOS 9 package for this computer";
+#endif
 			} else if (versionNewer(r.version, m_current)) {
 				m_release = r;
 			}
@@ -231,10 +245,18 @@ void UpdateWindow::checkDone() {
 
 void UpdateWindow::showResults() {
 	const bool zacos = m_release.valid;
+#ifdef ZACOS9_ARCH_PACKAGE
+	const int n = 0;
+#else
 	const int n = static_cast<int>(m_debian.size());
+#endif
 	QString detail;
 	if (zacos) {
+#ifdef ZACOS9_ARCH_PACKAGE
+		detail += "Archintosh OS 9 " + m_release.version + " is available (this computer has " +
+#else
 		detail += "ZacOS 9 " + m_release.version + " is available (this computer has " +
+#endif
 			(m_current.isEmpty() ? QString("an unknown version") : m_current) + "). ";
 	}
 	if (n > 0) {
@@ -246,7 +268,11 @@ void UpdateWindow::showResults() {
 			.arg(names.join(", ")).arg(n > 4 ? ", …" : "");
 	}
 	if (!m_releaseError.isEmpty()) {
+#ifdef ZACOS9_ARCH_PACKAGE
+		detail += "Couldn’t look for a new Archintosh OS 9: " + m_releaseError + ". ";
+#else
 		detail += "Couldn’t look for a new ZacOS 9: " + m_releaseError + ". ";
+#endif
 	}
 	if (!m_debianProblem.isEmpty()) {
 		detail += m_debianProblem;
@@ -267,10 +293,16 @@ void UpdateWindow::showResults() {
 		/* Up to date only if both checks really worked. */
 		const bool sure = m_releaseError.isEmpty() && m_debianProblem.isEmpty();
 		m_state = State::UpToDate;
+#ifdef ZACOS9_ARCH_PACKAGE
+		setText(sure ? "Your software is up to date." : "No updates were found.",
+			sure ? "Archintosh OS 9 " + m_current + " is the newest version available from your fork."
+				: detail.trimmed());
+#else
 		setText(sure ? "Your software is up to date." : "No updates were found.",
 			sure
 				? "ZacOS 9 " + m_current + " is the newest version, and Debian has no updates for it."
 				: detail.trimmed());
+#endif
 		setButtons("OK", QString());
 	}
 }
@@ -286,7 +318,11 @@ void UpdateWindow::install() {
 	if (m_release.valid) {
 		downloadDeb();
 	} else {
+#ifdef ZACOS9_ARCH_PACKAGE
+		finished();
+#else
 		upgradeDebian();
+#endif
 	}
 }
 
@@ -296,12 +332,20 @@ static double zacosShare(bool debianToo) {
 }
 
 void UpdateWindow::downloadDeb() {
+#ifdef ZACOS9_ARCH_PACKAGE
+	const double share = 1.0;
+#else
 	const double share = zacosShare(!m_debian.empty());
+#endif
 	const QString dir =
 		QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) + "/zacos9/updates";
 	QDir().mkpath(dir);
 	m_debPath = dir + "/" + QFileInfo(m_release.debName).fileName();
-	m_doing = "Downloading ZacOS 9 " + m_release.version;
+#ifdef ZACOS9_ARCH_PACKAGE
+		m_doing = "Downloading Archintosh OS 9 " + m_release.version;
+#else
+		m_doing = "Downloading ZacOS 9 " + m_release.version;
+#endif
 	QNetworkRequest req{ QUrl(m_release.debUrl) };
 	req.setRawHeader("User-Agent", "zacos9-update");
 	req.setTransferTimeout(60000);
@@ -320,13 +364,13 @@ void UpdateWindow::downloadDeb() {
 		}
 		m_reply = nullptr;
 		if (reply->error() != QNetworkReply::NoError) {
-			failed("ZacOS 9 " + m_release.version + " couldn’t be downloaded: " + reply->errorString() + ".");
+			failed("The update couldn’t be downloaded: " + reply->errorString() + ".");
 			return;
 		}
 		const QByteArray data = reply->readAll();
 		if (!m_release.sha256.isEmpty() &&
 				QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex() != m_release.sha256.toLatin1()) {
-			failed("The downloaded ZacOS 9 package is damaged (its checksum doesn’t match). Nothing was installed.");
+			failed("The downloaded package is damaged (its checksum doesn’t match). Nothing was installed.");
 			return;
 		}
 		QFile f(m_debPath);
@@ -340,6 +384,33 @@ void UpdateWindow::downloadDeb() {
 }
 
 void UpdateWindow::installDeb() {
+#ifdef ZACOS9_ARCH_PACKAGE
+	m_doing = "Verifying Arch package";
+	update();
+	auto fields = std::make_shared<QStringList>();
+	run("pacman", { "-Qp", "--print-format", "%n %v", m_debPath },
+		[this, fields](int code) {
+			const QString metadata = fields->join(' ').trimmed();
+			const QStringList parts = metadata.split(' ', Qt::SkipEmptyParts);
+			if (code != 0 || parts.size() != 2 || parts[0] != PACKAGE ||
+					parts[1] != m_release.version + "-1") {
+				failed("The downloaded file isn’t Archintosh OS 9 " + m_release.version + ". Nothing was installed.");
+				return;
+			}
+			m_doing = "Installing Archintosh OS 9 " + m_release.version;
+			update();
+			run("pkexec", { "pacman", "-U", "--needed", "--noconfirm", m_debPath }, [this](int result) {
+				if (result != 0) {
+					failed("Archintosh OS 9 " + m_release.version + " couldn’t be installed" +
+						(m_procErr.isEmpty() ? QString(".") : ": " + m_procErr));
+					return;
+				}
+				QFile::remove(m_debPath);
+				m_zacosUpdated = true;
+				finished();
+			});
+		}, [fields](const QString &line) { *fields << line; });
+#else
 	const double share = zacosShare(!m_debian.empty());
 	/* It must really be the release we offered, not some other package. */
 	auto fields = std::make_shared<QStringList>();
@@ -373,6 +444,7 @@ void UpdateWindow::installDeb() {
 			}
 		}, aptProgress(share * 0.4, share));
 	}, [fields](const QString &l) { *fields << l; });
+#endif
 }
 
 void UpdateWindow::upgradeDebian() {
@@ -394,7 +466,11 @@ void UpdateWindow::finished() {
 	m_state = State::Done;
 	m_progress = 1;
 	if (m_zacosUpdated) {
+#ifdef ZACOS9_ARCH_PACKAGE
+		setText("Archintosh OS 9 " + m_release.version + " is installed.",
+#else
 		setText("ZacOS 9 " + m_release.version + " is installed.",
+#endif
 			"Restart the computer to start using it. Programs that are open keep running the "
 			"old version until then.");
 		setButtons("Restart", "Later");

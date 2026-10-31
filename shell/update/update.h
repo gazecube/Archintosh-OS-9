@@ -14,11 +14,9 @@
 class QNetworkReply;
 
 /*
- * Software Update, from the Apple menu: one window that checks for a new
- * ZacOS 9 (the newest GitHub release's zacos9 .deb) and for Debian's own
- * updates (apt), lists what it found, and installs it all with one
- * button - the .deb through zacos9-appstore-helper install-deb, then
- * Debian's through its upgrade command. See docs/updates.md.
+ * Software Update, from the Apple menu: Debian builds check a GitHub .deb
+ * and apt updates; Arch builds check the fork's Arch package release and
+ * install it with pacman. See docs/updates.md.
  */
 class UpdateWindow : public QWidget {
 public:
@@ -55,7 +53,7 @@ private:
 	QString m_debianProblem; /* debianCheckProblem(): why "no updates" may be wrong */
 	int m_pendingChecks = 0;
 	bool m_zacosUpdated = false;
-	QString m_debPath;       /* the downloaded .deb */
+	QString m_debPath;       /* downloaded package asset */
 
 	PanelButton m_primary, m_secondary;
 	PanelCheckbox m_daily; /* "update-check": daily, unless "never" */
