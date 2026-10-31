@@ -49,8 +49,7 @@ build() {
   arch-meson "${srcdir}/${pkgname}" build \
     --prefix=/usr \
     --sysconfdir=/etc \
-    --libexecdir=lib/zacos9 \\
-    -Darch_package=true
+    --libexecdir=lib/zacos9 -Darch_package=true
   meson compile -C build
 }
 
