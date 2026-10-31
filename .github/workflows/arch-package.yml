@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: arch-release-package
+  group: arch-release-package-with-logs
   cancel-in-progress: false
 
 jobs:
