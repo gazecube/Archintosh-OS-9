@@ -64,21 +64,54 @@ reads the Appearance theme's resource fork and produces a **theme bundle** in
   changes apply the next time the desktop starts.
 - `boot/happy-zac-1x..6x.png` and `boot/zacos-logo-1x..6x.png` — replace the
   boot and Welcome artwork.
-- `wallpapers/` — the theme's `PICT` pictures as PNG (version 1 and 2,
-  including component-packed 32-bit rows). Compressed QuickTime pictures
-  (opcode `0x8200`) are skipped.
-- `patterns/` — the theme's pixel patterns (`ppat`, 1-bit to 32-bit) as PNG
-  tiles, named `colour-pattern-N.png`, plus the monochrome `PAT` tiles. Tiles
-  keep their own size; some are strips. Patterns with no decodable pixel data
-  are skipped.
+- `wallpapers/desktop-wallpaper.jpg|.png` — the desktop picture the theme names
+  (`scen` `dpnm`), found under `Appearance/Desktop Pictures` in your Mac OS 9
+  System Folder (a JPEG data fork is copied as-is, otherwise the `.rsrc`
+  companion's PICT is decoded). The theme file's own PICTs are its credit
+  splash (id 128) and the Appearance panel's preview thumbnails (the `scen`
+  `epic` ids), never wallpapers, so they are skipped.
+- `patterns/desktop-pattern.png` — the desktop pattern, stored inside the
+  `scen` collection (`patt` tag), plus the monochrome `PAT` tiles as
+  `pattern-N.png`. The theme file's colour `ppat` resources are scroll-bar,
+  window-border and button skins, not desktop art, so the installer leaves
+  `colour-pattern-N.png` files out.
+- `fonts/views.pfont` and `fonts/system.pfont` — the theme's fonts, from your
+  Mac OS 9 System file and Fonts folder: the views font at the theme's views
+  size, and the system font at 12 points. A family's bitmap strike is used
+  when it has one for that size (NFNT); otherwise its TrueType font is
+  rasterised at that size (Charcoal, for example). Bitmap strikes keep their
+  offset/width-table advances and side bearings, including the space width.
+  ZacOS loads them at 1x and
+  keeps its own fonts at 1.25x, 1.5x and 1.75x. Families not on your Mac
+  (Tecton, Osaka...) keep ZacOS's fonts. TrueType glyphs are rasterised
+  without Mac hinting, one bit per pixel.
+ - `chrome/*.png` — the window-frame skins, from the theme's named frame
+  patterns (`document window top/bottom/left/right`, `Modal Top/...`,
+  `document window tab center`, each with an `inactive` variant where the
+  theme ships one). The compositor tiles them over title bars and borders;
+  the menu bar, dropdown menus and the selected item use the `menu
+  background` / `menu highlight` skins. Close/zoom/collapse boxes, title
+  text and hit-testing stay ZacOS's. Scrollbars tile the `scroll-track-*`
+  and three-part `scroll-thumb-*` skins (caps with the stretch between,
+  stretch alone when short); the arrows and disabled state stay procedural.
+  Buttons tile the `button` face inside their rounded border
+  (`-inactive`/`-pressed` variants when the theme ships them). The
+  determinate progress fill uses `progress-fill`. Missing files fall back
+  to the Platinum drawing.
 - `sounds/` — alert sounds. `system-sound-N.wav` are the System file's own
   `snd` resources, decoded from sampled sounds only; synthesized and compressed
   sounds are skipped. Theme-file sounds sit beside them. The installer never
   picks a `system-` sound as the theme's default alert.
-- The installer copies `wallpapers/`, `patterns/` and `sounds/` into the
-  Appearance folders. It also copies every set in `Appearance add-ons/Sound
-  Sets` into Sound Themes. Those sound-set clips get a 4 ms fade in and out;
-  the System alert sounds don't yet.
+ - The installer copies the desktop wallpaper, the desktop pattern and the
+  sounds into the Appearance folders. It also copies every set in
+  `Appearance add-ons/Sound Sets` into Sound Themes, and selects the theme's
+  own set (`scen` `sndt`, e.g. Aqua's Platinum Sounds) when it is installed;
+  otherwise no sound theme is chosen. Those sound-set clips
+  get a 4 ms fade in and out; the System alert sounds don't yet.
+- The installer applies the theme at once: it writes the pattern, wallpaper,
+  background (`wallpaper` when a wallpaper was installed, else `pattern`)
+  and alert sound into `theme.conf` and the desktop settings, then applies
+  the bundle. Re-clicking the theme in Appearance is not needed.
 
 The extractor (`tools/extract-macos9-theme.py`) decodes the classic icon,
 PICT, pattern and sound resources (`macpict.py`, `macpat.py`, `macsnd.py`); `--list-cluts` prints the colour tables and

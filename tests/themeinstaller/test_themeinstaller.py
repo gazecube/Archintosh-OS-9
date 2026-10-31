@@ -92,4 +92,34 @@ assert os.path.isfile(os.path.join(out, "menu-icon.png")), "menu icon written"
 assert os.path.isfile(os.path.join(out, "theme.conf")), "theme.conf written"
 print("ok    theme file installs and inherits its name")
 
+# The installer applies the desktop settings itself: theme.conf and
+# desktop.conf agree, and the background falls back to pattern.
+def conf_dict(path):
+    out = {}
+    with open(path) as f:
+        for line in f.read().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+conf = conf_dict(os.path.join(out, "theme.conf"))
+desktop = conf_dict(os.path.join(config, "zacos9", "desktop.conf"))
+assert desktop.get("theme-bundle") == "Apple platinum", desktop
+assert desktop.get("background") == "pattern", desktop
+assert "background" not in conf, conf  # no desktop art in this theme
+assert "sound-theme" not in desktop, desktop  # its sound set is not installed
+print("ok    installed theme is applied to theme.conf and desktop.conf")
+
+# The preset names pattern and wallpaper by the Appearance panel's catalog ids:
+# the prefix, the SHA-256 of the file name, then ":image".
+import glob, json, re
+presets = [json.load(open(f)) for f in glob.glob(os.path.join(data, "zacos9", "appearance", "Themes", "*.json"))]
+themed = [p["settings"] for p in presets if p["settings"].get("theme-bundle") == "Apple platinum"]
+assert themed, "a preset for the theme"
+catalog = re.compile(r"\A(user|wallpaper):[0-9a-f]{64}:image\Z")
+for key in ("pattern", "wallpaper"):
+    if key in themed[0]:
+        assert catalog.match(themed[0][key]), (key, themed[0][key])
+print("ok    preset names pattern and wallpaper by catalog id")
+
 print("OK")

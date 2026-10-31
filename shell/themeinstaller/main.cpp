@@ -22,6 +22,7 @@
 #include <QStringList>
 #include <QSaveFile>
 #include <QTextStream>
+#include <algorithm>
 #include <cstdio>
 
 #include "programs.h"
@@ -50,7 +51,7 @@ static bool bundleHasTheme(const QString &name) {
 
 /* Run the extractor and wait with processEvents() (never waitForFinished). */
 static bool runExtractor(const QString &file, const QString &name, const QString &system,
-		QString *error) {
+		const QString &fonts, QString *error) {
 	const QString tool = extractorPath();
 	if (!QFileInfo(tool).isFile()) {
 		*error = "The theme extractor couldn't be found.";
@@ -62,6 +63,13 @@ static bool runExtractor(const QString &file, const QString &name, const QString
 		"--auto-colours" };
 	if (!system.isEmpty()) {
 		args << "--system" << system;
+	}
+	const QString pictures = QDir::homePath() + "/Classic/System Folder/Appearance/Desktop Pictures";
+	if (QFileInfo::exists(pictures)) {
+		args << "--pictures" << pictures;
+	}
+	if (!fonts.isEmpty()) {
+		args << "--fonts" << fonts;
 	}
 	process.setArguments(args);
 	process.start();
@@ -147,7 +155,8 @@ static QString themeConfValue(const QString &name, const QString &key) {
 /* Write the appearance preset JSON that the Appearance panel's Themes list
  * shows, so the extracted theme appears there and applies its settings. */
 static QString writeAppearancePreset(const QString &name, const QString &wallpaper,
-		const QString &pattern, const QString &alert, QString *error) {
+		const QString &pattern, const QString &alert, const QString &soundTheme,
+		QString *error) {
 	const QString folder = appearanceThemesFolder();
 	if (!QDir().mkpath(folder)) {
 		*error = "Couldn't create the appearance Themes folder.";
@@ -167,6 +176,7 @@ static QString writeAppearancePreset(const QString &name, const QString &wallpap
 	put("pattern", pattern);
 	put("wallpaper", wallpaper);
 	put("alert-sound", alert);
+	put("sound-theme", soundTheme);
 	put("theme-bundle", name);
 	QSaveFile output(path);
 	const QByteArray bytes = QJsonDocument(QJsonObject{
@@ -177,6 +187,14 @@ static QString writeAppearancePreset(const QString &name, const QString &wallpap
 	}
 	return "theme:" + QString::fromLatin1(QCryptographicHash::hash(
 		filename.toUtf8(), QCryptographicHash::Sha256).toHex().left(24));
+}
+
+/* The id the Appearance panel gives a PNG in the Desktop Patterns (user) or
+ * Wallpaper folder: the prefix, the SHA-256 of the file name, then "image"
+ * (see shell/panels/zacos9-patterns). */
+static QString catalogId(const char *prefix, const QString &fileName) {
+	const QByteArray digest = QCryptographicHash::hash(fileName.toUtf8(), QCryptographicHash::Sha256);
+	return QString::fromLatin1(prefix) + ":" + QString::fromLatin1(digest.toHex()) + ":image";
 }
 
 /* Copy the decoded wallpapers, pattern tiles and sounds into the Appearance
@@ -196,7 +214,33 @@ static void installThemeAssets(const QString &name, QString *wallpaper,
 		const QString src = outputDir(name) + "/" + f.sub;
 		const QString dest = base + "/" + f.dest;
 		QDir().mkpath(dest);
-		const QFileInfoList files = QDir(src).entryInfoList(QDir::Files, QDir::Name);
+		QFileInfoList files = QDir(src).entryInfoList(QDir::Files, QDir::Name);
+		if (f.sub == QStringLiteral("patterns")) {
+			// Only the desktop pattern (scen patt) and mono PAT tiles are
+			// desktop art; the colour-pattern files are widget skins.
+			QFileInfoList kept;
+			for (const QFileInfo &file : files) {
+				if (file.fileName() == "desktop-pattern.png" ||
+						file.fileName().startsWith("pattern-")) {
+					kept << file;
+				}
+			}
+			files = kept;
+			// Prefer the theme's own desktop pattern.
+			std::sort(files.begin(), files.end(), [](const QFileInfo &a, const QFileInfo &b) {
+				const bool ad = a.fileName() == "desktop-pattern.png";
+				const bool bd = b.fileName() == "desktop-pattern.png";
+				return ad != bd ? ad : a.fileName() < b.fileName();
+			});
+		}
+		if (f.sub == QStringLiteral("wallpapers")) {
+			// Prefer the dpnm desktop wallpaper over stray pictures.
+			std::sort(files.begin(), files.end(), [](const QFileInfo &a, const QFileInfo &b) {
+				const bool ad = a.fileName().startsWith("desktop-wallpaper.");
+				const bool bd = b.fileName().startsWith("desktop-wallpaper.");
+				return ad != bd ? ad : a.fileName() < b.fileName();
+			});
+		}
 		for (const QFileInfo &file : files) {
 			const QString id = prefix + "-" + file.completeBaseName();
 			QFile::copy(file.filePath(), dest + "/" + id + "." + file.suffix());
@@ -207,10 +251,79 @@ static void installThemeAssets(const QString &name, QString *wallpaper,
 				continue;
 			}
 			const QString id = prefix + "-" + file.completeBaseName();
-			if (f.sub == QStringLiteral("wallpapers")) *wallpaper = id;
-			else if (f.sub == QStringLiteral("patterns")) *pattern = id;
+			const QString copied = id + "." + file.suffix();
+			if (f.sub == QStringLiteral("wallpapers")) *wallpaper = catalogId("wallpaper", copied);
+			else if (f.sub == QStringLiteral("patterns")) *pattern = catalogId("user", copied);
 			else *alert = id;
 			break;
+		}
+	}
+}
+
+/* The sound-theme catalog id for a Mac sound set name (its sndt): the set's
+ * path in Sound Themes, with any AppleDouble leaf resolved, hashed the way
+ * shell/panels/zacos9-soundthemes does ("user:" + SHA-256, first 32 hex).
+ * "" when the set isn't installed. */
+static QString soundThemeId(const QString &soundThemes, const QString &setName) {
+	if (setName.isEmpty()) {
+		return QString();
+	}
+	const QDir base(soundThemes);
+	for (const QFileInfo &top : base.entryInfoList(
+			QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot, QDir::Name)) {
+		if (top.fileName() == ".DS_Store") {
+			continue;
+		}
+		if (top.isDir()) {
+			for (const QFileInfo &child : QDir(top.filePath()).entryInfoList(QDir::Files, QDir::Name)) {
+				QString leaf = child.fileName();
+				if (leaf.startsWith("._")) {
+					leaf = leaf.mid(2);
+				}
+				if (leaf != setName) {
+					continue;
+				}
+				const QString identity = top.fileName() + "/" + leaf;
+				return "user:" + QString::fromLatin1(QCryptographicHash::hash(
+					identity.toUtf8(), QCryptographicHash::Sha256).toHex().left(32));
+			}
+			continue;
+		}
+		QString leaf = top.fileName();
+		if (leaf.startsWith("._")) {
+			leaf = leaf.mid(2);
+		}
+		if (leaf != setName) {
+			continue;
+		}
+		return "user:" + QString::fromLatin1(QCryptographicHash::hash(
+			leaf.toUtf8(), QCryptographicHash::Sha256).toHex().left(32));
+	}
+	return QString();
+}
+
+/* Set a key=value line in the bundle's theme.conf, adding it when absent. */
+static void setThemeConfValue(const QString &name, const char *key, const QString &value) {
+	const QString path = outputDir(name) + "/theme.conf";
+	QFile f(path);
+	QStringList lines;
+	if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+		QTextStream in(&f);
+		QString line;
+		while (in.readLineInto(&line)) {
+			if (!line.startsWith(QString::fromLatin1(key) + "=")) {
+				lines << line;
+			}
+		}
+		f.close();
+	}
+	if (!value.isEmpty()) {
+		lines << QString::fromLatin1(key) + "=" + value;
+	}
+	if (f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+		QTextStream out(&f);
+		for (const QString &l : lines) {
+			out << l << "\n";
 		}
 	}
 }
@@ -323,8 +436,10 @@ int main(int argc, char *argv[]) {
 	}
 	const QString systemFork = system.isEmpty() ? QString() : resolveResourceFork(system);
 
+	/* The Fonts folder supplies the theme's bitmap fonts (Geneva, Chicago...). */
+	const QString fonts = QDir::homePath() + "/Classic/System Folder/Fonts";
 	QString error;
-	if (!runExtractor(fork, name, systemFork, &error)) {
+	if (!runExtractor(fork, name, systemFork, QFileInfo::exists(fonts) ? fonts : QString(), &error)) {
 		if (batch) {
 			fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(error));
 			return 2;
@@ -354,7 +469,8 @@ int main(int argc, char *argv[]) {
 		"/zacos9/appearance/Sound Themes";
 	const int soundSets = copyMacSoundSets(
 		QDir::homePath() + "/Classic/Appearance add-ons/Sound Sets", soundThemes);
-	const QString presetId = writeAppearancePreset(name, wallpaper, pattern, alert, &error);
+	const QString soundId = soundThemeId(soundThemes, themeConfValue(name, "sound-set"));
+	const QString presetId = writeAppearancePreset(name, wallpaper, pattern, alert, soundId, &error);
 	if (presetId.isEmpty()) {
 		if (batch) {
 			fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(error));
@@ -362,6 +478,27 @@ int main(int argc, char *argv[]) {
 		}
 		QMessageBox::critical(nullptr, "Theme Installer", error);
 		return 2;
+	}
+	// The preset named the desktop art; apply it now, not just when the user
+	// re-clicks the theme in Appearance. Wallpaper wins over pattern.
+	setThemeConfValue(name, "pattern", pattern);
+	setThemeConfValue(name, "wallpaper", wallpaper);
+	setThemeConfValue(name, "background", !wallpaper.isEmpty() ? "wallpaper" :
+		!pattern.isEmpty() ? "pattern" : "");
+	setThemeConfValue(name, "alert-sound", alert);
+	setThemeConfValue(name, "sound-theme", soundId);
+	if (!soundId.isEmpty()) {
+		pl_setting_set("sound-theme", soundId.toUtf8().constData());
+	}
+	if (!pattern.isEmpty()) {
+		pl_setting_set("pattern", pattern.toUtf8().constData());
+	}
+	if (!wallpaper.isEmpty()) {
+		pl_setting_set("wallpaper", wallpaper.toUtf8().constData());
+	}
+	pl_setting_set("background", !wallpaper.isEmpty() ? "wallpaper" : "pattern");
+	if (!alert.isEmpty()) {
+		pl_setting_set("alert-sound", alert.toUtf8().constData());
 	}
 	pl_setting_set("appearance-theme", presetId.toUtf8().constData());
 	pl_setting_set("theme-bundle", name.toUtf8().constData());

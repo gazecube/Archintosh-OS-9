@@ -1,6 +1,10 @@
 #include "decor.h"
 
+#include <cairo.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include "chrome.h"
 #include "icons.h"
 #include "theme.h"
 
@@ -19,6 +23,34 @@
 static uint32_t chrome(const char *key, uint32_t fallback) {
 	uint32_t v;
 	return zac_theme_color(key, &v) ? v : fallback;
+}
+
+/* Window-frame skins: the bundle files per frame part, active and
+ * inactive. An inactive window uses the -inactive skin when the theme ships
+ * one, else its active skin; missing files keep the Platinum drawing. */
+enum chrome_slot {
+	CHROME_DOC_TOP, CHROME_DOC_BOTTOM, CHROME_DOC_LEFT, CHROME_DOC_RIGHT,
+	CHROME_MODAL_TOP, CHROME_MODAL_BOTTOM, CHROME_MODAL_LEFT, CHROME_MODAL_RIGHT,
+	CHROME_POPUP_TAB,
+	CHROME_SLOTS
+};
+
+static const char *const chrome_files[CHROME_SLOTS][2] = {
+	[CHROME_DOC_TOP] = { "chrome/document-top.png", "chrome/document-top-inactive.png" },
+	[CHROME_DOC_BOTTOM] = { "chrome/document-bottom.png", "chrome/document-bottom-inactive.png" },
+	[CHROME_DOC_LEFT] = { "chrome/document-left.png", "chrome/document-left-inactive.png" },
+	[CHROME_DOC_RIGHT] = { "chrome/document-right.png", "chrome/document-right-inactive.png" },
+	[CHROME_MODAL_TOP] = { "chrome/modal-top.png", NULL },
+	[CHROME_MODAL_BOTTOM] = { "chrome/modal-bottom.png", NULL },
+	[CHROME_MODAL_LEFT] = { "chrome/modal-left.png", NULL },
+	[CHROME_MODAL_RIGHT] = { "chrome/modal-right.png", NULL },
+	[CHROME_POPUP_TAB] = { "chrome/popup-tab.png", "chrome/popup-tab-inactive.png" },
+};
+
+static void chrome_fill_slot(struct pl_canvas *c, int x0, int y0, int x1, int y1,
+		enum chrome_slot slot, bool active, uint32_t fallback) {
+	const char *path = chrome_files[slot][!active && chrome_files[slot][1] ? 1 : 0];
+	chrome_fill(c, x0, y0, x1, y1, path, fallback);
 }
 
 /* Title-bar boxes: 12x12 at y=4, 1 px emboss right and below. */
@@ -343,12 +375,12 @@ static void paint_modal(struct pl_canvas *c, const struct decor_state *st) {
 	const uint32_t face = act ? chrome("frame-face", C_CCC) : chrome("frame-face-inactive", C_DDD);
 
 	/* Title bar: rows 0..21, as a collapsed document window's. */
-	pl_fill(c, 0, 0, W - 1, 21, face);
+	chrome_fill_slot(c, 0, 0, W - 1, 21, CHROME_MODAL_TOP, act, face);
 	/* Body edges (the client paints the interior). */
-	pl_fill(c, 0, 22, 2, H - 1, C_DDD);
-	pl_fill(c, W - 3, 22, W - 1, H - 1, C_DDD);
-	pl_fill(c, 0, 22, W - 1, 23, C_DDD);
-	pl_fill(c, 0, H - 3, W - 1, H - 1, C_DDD);
+	chrome_fill_slot(c, 0, 22, 2, H - 1, CHROME_MODAL_LEFT, act, C_DDD);
+	chrome_fill_slot(c, W - 3, 22, W - 1, H - 1, CHROME_MODAL_RIGHT, act, C_DDD);
+	chrome_fill_slot(c, 0, 22, W - 1, 23, CHROME_MODAL_BOTTOM, act, C_DDD);
+	chrome_fill_slot(c, 0, H - 3, W - 1, H - 1, CHROME_MODAL_BOTTOM, act, C_DDD);
 
 	const uint32_t m_light = chrome("frame-light", C_WHITE);
 	const uint32_t m_shadow = chrome("frame-dark", C_999);
@@ -424,7 +456,7 @@ static void paint_popup(struct pl_canvas *c, const struct decor_state *st) {
 	const bool tab_act = act || st->collapsed;
 	const uint32_t tab_border = tab_act ? C_BLACK : C_555;
 	const uint32_t tab_face = tab_act ? C_CCC : C_DDD;
-	pl_fill(c, x0 + 1, 1, x1 - 1, H > y0 ? y0 : H - 1, tab_face);
+	chrome_fill_slot(c, x0 + 1, 1, x1 - 1, H > y0 ? y0 : H - 1, CHROME_POPUP_TAB, tab_act, tab_face);
 	pl_hline(c, x0 + 2, x1 - 2, 0, tab_border);
 	pl_put(c, x0 + 1, 1, tab_border);
 	pl_put(c, x1 - 1, 1, tab_border);
@@ -467,12 +499,12 @@ void decor_paint(struct pl_canvas *c, const struct decor_state *st) {
 
 	/* Frame fill, never touching the client area. */
 	if (st->collapsed) {
-		pl_fill(c, 0, 0, W - 1, H - 1, face);
+		chrome_fill_slot(c, 0, 0, W - 1, H - 1, CHROME_DOC_TOP, act, face);
 	} else {
-		pl_fill(c, 0, 0, W - 1, DECOR_TOP - 1, face);
-		pl_fill(c, 0, H - DECOR_BOTTOM, W - 1, H - 1, face);
-		pl_fill(c, 0, DECOR_TOP, DECOR_LEFT - 1, H - DECOR_BOTTOM - 1, face);
-		pl_fill(c, W - DECOR_RIGHT, DECOR_TOP, W - 1, H - DECOR_BOTTOM - 1, face);
+		chrome_fill_slot(c, 0, 0, W - 1, DECOR_TOP - 1, CHROME_DOC_TOP, act, face);
+		chrome_fill_slot(c, 0, H - DECOR_BOTTOM, W - 1, H - 1, CHROME_DOC_BOTTOM, act, face);
+		chrome_fill_slot(c, 0, DECOR_TOP, DECOR_LEFT - 1, H - DECOR_BOTTOM - 1, CHROME_DOC_LEFT, act, face);
+		chrome_fill_slot(c, W - DECOR_RIGHT, DECOR_TOP, W - 1, H - DECOR_BOTTOM - 1, CHROME_DOC_RIGHT, act, face);
 	}
 
 	const uint32_t highlight = chrome("frame-light", C_WHITE);

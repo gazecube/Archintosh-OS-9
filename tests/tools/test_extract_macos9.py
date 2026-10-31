@@ -107,6 +107,56 @@ def build_scen(items):
     return header + headers + _s.pack(">I", len(pool)) + pool
 
 
+def test_scen_patt_epic():
+    # scen with a patt blob (desktop pattern), an epic id and a dpnm name.
+    import struct as _s
+    patt = bytes(28)  # type-1 header stub; decode failure is fine, capture matters
+    scen = build_scen([(b"patt", patt), (b"epic", _s.pack(">h", 2011)),
+                       (b"dpnm", bytes((5,)) + b"Beach"),
+                       (b"sndt", bytes((5,)) + b"Waves")])
+    # A minimal version-1 8x1 BitsRect PICT (kept: not epic, not splash).
+    pict = (_s.pack(">H", 0) + _s.pack(">hhhh", 0, 0, 1, 8) + b"\x11\x01" + bytes((0x90,))
+            + _s.pack(">H", 1) + _s.pack(">hhhh", 0, 0, 1, 8)
+            + _s.pack(">hhhh", 0, 0, 1, 8) * 2 + _s.pack(">H", 0) + b"\x80" + b"\xff")
+    fork = build_resource_fork([(b"scen", 128, scen), (b"PICT", 2011, b"preview"),
+                                (b"PICT", 128, b"splash"), (b"PICT", 129, pict)])
+    with tempfile.TemporaryDirectory() as src:
+        path = os.path.join(src, "T")
+        with open(path, "wb") as f:
+            f.write(fork)
+        out = os.path.join(src, "out")
+        r = subprocess.run([sys.executable, sys.argv[1], "--file", path,
+                            "--output", out, "--name", "T"],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        # epic 2011 and splash 128 are skipped; other PICTs are kept.
+        walls = os.listdir(os.path.join(out, "wallpapers"))
+        assert not any("2011" in w or w == "picture-128.png" for w in walls), walls
+        assert any("129" in w for w in walls), walls
+        with open(os.path.join(out, "theme.conf")) as f:
+            conf = f.read()
+        assert "desktop-picture=Beach" in conf, conf
+        assert "sound-set=Waves" in conf, conf
+    print("ok    scen patt, epic exclusion and dpnm captured")
+
+
+def test_chrome_slots():
+    assert tool.chrome_slot("document window top") == "document-top"
+    assert tool.chrome_slot("Document Window Top Inactive") == "document-top-inactive"
+    assert tool.chrome_slot("WINDOW TITLE") == "document-top"
+    assert tool.chrome_slot("Modal Bottom") == "modal-bottom"
+    assert tool.chrome_slot("document window tab center") == "popup-tab"
+    assert tool.chrome_slot("horz thumb grippy") is None
+    assert tool.chrome_slot("Menu Bar Pressed") is None
+    assert tool.chrome_slot("Menu background") == "menu-background"
+    assert tool.chrome_slot("Menu Highlight") == "menu-highlight"
+    assert tool.chrome_slot("Horz Thumb Stretch") == "scroll-thumb-horz-stretch"
+    assert tool.chrome_slot("V Scroll Track") == "scroll-track-vert"
+    assert tool.chrome_slot("Progress Bar Innards Active") == "progress-fill"
+    assert tool.chrome_slot("Button Pressed") == "button-pressed"
+    print("ok    chrome slot mapping")
+
+
 def test_clut_positional():
     import importlib.util as _iu
     spec = _iu.spec_from_file_location("macicons", os.path.join(os.path.dirname(sys.argv[1]), "macicons.py"))
@@ -209,6 +259,19 @@ def test_system_sounds():
     print("ok    system sounds written")
 
 
+def test_apple_menu():
+    # A 16x16 8-bit icon whose every pixel is index 1, and a 256-entry palette.
+    palette = [(i, (i, 0, 0)) for i in range(256)]
+    with tempfile.TemporaryDirectory() as out:
+        tool.write_apple_menu({b"ics8": [bytes([1]) * 256]}, [(9, palette)], out)
+        path = os.path.join(out, "apple-menu.png")
+        assert os.path.isfile(path), "apple-menu.png written"
+        with open(path, "rb") as f:
+            head = f.read(24)
+        assert struct.unpack(">II", head[16:24]) == (16, 16)
+    print("ok    apple menu icon written")
+
+
 def test_scen():
     data = build_scen([
         (b"name", b"\x0bConvergence"),
@@ -237,7 +300,10 @@ test_end_to_end()
 test_clut_positional()
 test_wctb()
 test_cicn()
+test_chrome_slots()
 test_scen()
 test_pointers()
 test_system_sounds()
+test_apple_menu()
+test_scen_patt_epic()
 print("OK")
