@@ -25,5 +25,5 @@ jobs:
           git remote add upstream https://github.com/chromasystemprofessional/Zac-OS-9.git
           git fetch upstream main
           git switch main
-          git merge --ff-only upstream/main
+          git merge --no-edit upstream/main
           git push origin main
