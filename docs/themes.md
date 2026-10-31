@@ -53,14 +53,35 @@ reads the Appearance theme's resource fork and produces a **theme bundle** in
 - `apple-menu.png` — 16×16, the System file's menu-bar Apple icon
   (`ics8`/`ics4` id -16386), decoded when the user's own Mac OS 9 System
   file is present; kept separate so a theme can use it explicitly.
+- `index.theme` and `cursors/` — the pointers, as an Xcursor theme named after
+  the bundle folder. `index.theme` inherits everything else from ZacOS9, so a
+  pointer the bundle doesn't supply keeps ZacOS's. The arrow family (`default`,
+  `copy`, `alias`, `context-menu`) comes from the theme file's colour cursors
+  (`crsr` 128–131). The busy, resize, move, pointing and grabbing hands,
+  crosshair, progress and not-allowed pointers come from the System file
+  (`--system`, or `~/Classic/System/System` in the Theme Installer). Each is
+  written at 1×, 2× and 3×. The compositor reads the bundle at start-up, so
+  changes apply the next time the desktop starts.
 - `boot/happy-zac-1x..6x.png` and `boot/zacos-logo-1x..6x.png` — replace the
   boot and Welcome artwork.
-- `wallpapers/`, `patterns/` and `sounds/` — decoded desktop pictures, pattern
-  tiles and alert sounds, copied into the Appearance folders when the theme is
-  installed.
+- `wallpapers/` — the theme's `PICT` pictures as PNG (version 1 and 2,
+  including component-packed 32-bit rows). Compressed QuickTime pictures
+  (opcode `0x8200`) are skipped.
+- `patterns/` — the theme's pixel patterns (`ppat`, 1-bit to 32-bit) as PNG
+  tiles, named `colour-pattern-N.png`, plus the monochrome `PAT` tiles. Tiles
+  keep their own size; some are strips. Patterns with no decodable pixel data
+  are skipped.
+- `sounds/` — alert sounds. `system-sound-N.wav` are the System file's own
+  `snd` resources, decoded from sampled sounds only; synthesized and compressed
+  sounds are skipped. Theme-file sounds sit beside them. The installer never
+  picks a `system-` sound as the theme's default alert.
+- The installer copies `wallpapers/`, `patterns/` and `sounds/` into the
+  Appearance folders. It also copies every set in `Appearance add-ons/Sound
+  Sets` into Sound Themes. Those sound-set clips get a 4 ms fade in and out;
+  the System alert sounds don't yet.
 
 The extractor (`tools/extract-macos9-theme.py`) decodes the classic icon,
-PICT, pattern and sound resources; `--list-cluts` prints the colour tables and
+PICT, pattern and sound resources (`macpict.py`, `macpat.py`, `macsnd.py`); `--list-cluts` prints the colour tables and
 `--auto-colours` (or `--accent`/`--highlight`/`--pattern`) set the chrome
 colours. Window geometry (title-bar height, close/zoom/collapse positions,
 margins) is never changed — only colours and artwork.

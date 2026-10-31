@@ -39,7 +39,7 @@ ICON_TYPES = {b"ICN#", b"icl8", b"icl4", b"ics#", b"ics8", b"ics4", b"icns", b"I
 PATTERN_TYPES = {b"PAT ", b"PAT#", b"ppat"}
 SOUND_TYPES = {b"snd "}
 PICT_TYPES = {b"PICT"}
-THEME_TYPES = {b"thme", b"clut", b"pltt", b"WIND", b"scen"}
+THEME_TYPES = {b"thme", b"clut", b"pltt", b"WIND", b"scen", b"cicn", b"crsr", b"CURS", b"wctb"}
 
 
 def parse_resource_fork(data):
@@ -279,12 +279,42 @@ def decode_scen_collection(data):
 	return tags
 
 
-def process_resource_fork(data, out, counts, cluts, icons, assets, scen_tags, apple_menu):
+WCTB_PARTS = {
+	0: "window-content", 1: "window-frame", 2: "window-text", 3: "window-hilite",
+	4: "window-titlebar", 5: "window-hilite-light", 6: "window-hilite-dark",
+	7: "window-titlebar-light", 8: "window-titlebar-dark", 9: "window-dialog-light",
+	10: "window-dialog-dark", 11: "window-tinge-light", 12: "window-tinge-dark",
+}
+
+
+def decode_wctb(data):
+	"""Decode a window colour table ('wctb') to {part-name: "#rrggbb"}.
+
+	Format: 6 unused bytes, then a u16 count-minus-one, then (count) records
+	of {part id (u16), r (u16), g (u16), b (u16)}."""
+	if len(data) < 8:
+		return {}
+	count = struct.unpack(">H", data[6:8])[0] + 1
+	out = {}
+	pos = 8
+	for _ in range(count):
+		if pos + 8 > len(data):
+			break
+		part, r, g, b = struct.unpack(">HHHH", data[pos:pos + 8])
+		name = WCTB_PARTS.get(part, "window-part-%d" % part)
+		out[name] = "%02x%02x%02x" % (r >> 8, g >> 8, b >> 8)
+		pos += 8
+	return out
+
+
+def process_resource_fork(data, out, counts, cluts, icons, assets, scen_tags, apple_menu, wctb, raw_icons):
 	for rtype, res_id, body in parse_resource_fork(data):
 		bucket = bucket_for(rtype)
 		if not bucket:
 			continue
-		write_unique(os.path.join(out, bucket), "%s_%d.bin" % (rtype.decode("latin1"), res_id), body)
+		if bucket not in ("sounds", "patterns"):
+			# Sounds and patterns are written decoded by write_assets, never as raw .bin.
+			write_unique(os.path.join(out, bucket), "%s_%d.bin" % (rtype.decode("latin1"), res_id), body)
 		counts[bucket] += 1
 		if rtype == b"clut":
 			cols = parse_clut(body)
@@ -298,10 +328,16 @@ def process_resource_fork(data, out, counts, cluts, icons, assets, scen_tags, ap
 			icons.setdefault(rtype, []).append(body)
 		if rtype in (b"ics8", b"ics4", b"ics#") and res_id == -16386:
 			apple_menu.setdefault(rtype, []).append(body)
+		if rtype == b"wctb" and res_id == 0 and not wctb:
+			wctb.update(decode_wctb(body))
+		if rtype in (b"cicn", b"crsr", b"CURS"):
+			raw_icons.setdefault(rtype, {})[res_id] = body
 		if rtype == b"PICT":
 			assets.setdefault("pict", []).append(body)
 		if rtype in (b"PAT ", b"PAT#"):
 			assets.setdefault("pat", []).append(body)
+		if rtype == b"ppat":
+			assets.setdefault("ppat", []).append(body)
 		if rtype == b"snd ":
 			assets.setdefault("snd", []).append(body)
 
@@ -333,6 +369,155 @@ def write_apple_menu(apple_menu, cluts, out):
 	pngwrite.write_png(os.path.join(out, "apple-menu.png"), 16, 16, rows)
 
 
+def write_icon_dump(raw_icons, cluts, out):
+	"""Decode cicn/crsr/CURS resources for visual checking (--dump-icons)."""
+	# Indexed icons pick their palette by depth: 4-bit uses the 16-entry
+	# system table, 8-bit the 256-entry table.
+	cluts_by_size = {}
+	for _rid, cols in cluts:
+		cluts_by_size.setdefault(len(cols), cols)
+	lines = []
+	for rtype in (b"cicn", b"crsr", b"CURS"):
+		for res_id, body in sorted(raw_icons.get(rtype, {}).items()):
+			tag = rtype.decode("latin1")
+			try:
+				if rtype == b"cicn":
+					rows = macicons.decode_cicn(body, cluts=cluts_by_size)
+					sub = "icons"
+					name = "cicn_%d.png" % res_id
+				elif rtype == b"crsr":
+					rows, hot = macicons.decode_crsr(body, cluts=cluts_by_size)
+					sub = "cursors"
+					name = "crsr_%d.png" % res_id
+					lines.append("%s %d hotspot=%d,%d" % (tag, res_id, hot[0], hot[1]))
+				else:
+					continue
+				pngwrite.write_png(os.path.join(out, sub, name), len(rows[0]), len(rows), rows)
+				lines.append("%s %d -> %s/%s" % (tag, res_id, sub, name))
+			except (ValueError, IndexError, struct.error) as e:
+				lines.append("%s %d skipped: %s" % (tag, res_id, e))
+	with open(os.path.join(out, "icons-dump.txt"), "w") as f:
+		f.write("\n".join(lines) + "\n")
+	print("Wrote icons-dump.txt (%d resources decoded)" % len(lines))
+
+
+# Pointer roles. The System file supplies the busy, resize, move, hand and
+# crosshair pointers; a theme file supplies the arrow family (its colour
+# 'crsr' 128-131). Every name listed is written as the same cursor file.
+SYSTEM_POINTERS = (
+	("CURS", range(-20721, -20714), ("watch", "wait")),        # busy: wristwatch
+	("CURS", range(-20708, -20700), ("progress",)),           # busy: spinning wheel
+	("CURS", (-20852,), ("left_side", "w-resize")),
+	("CURS", (-20851,), ("right_side", "e-resize")),
+	("CURS", (-20850,), ("fleur", "move")),
+	("CURS", (3,), ("crosshair", "cross")),
+	("CURS", (-5760,), ("not-allowed", "no-drop")),
+	("crsr", (-20877,), ("pointer", "hand2")),
+	("crsr", (-20876,), ("grabbing",)),
+)
+THEME_POINTERS = (
+	(128, ("default", "left_ptr", "arrow")),
+	(129, ("copy", "dnd-copy")),
+	(130, ("alias", "link", "dnd-link")),
+	(131, ("context-menu",)),
+)
+POINTER_SIZES = (16, 32, 48)  # 1x, 2x, 3x; scaled nearest-neighbour from 16 px
+POINTER_FRAME_MS = 100
+
+
+def write_xcursor(path, frames, hot, delay, sizes):
+	"""Write an Xcursor file: each frame at each nominal size, in order."""
+	chunks = []
+	toc = []
+	pos = 16 + 12 * len(sizes) * len(frames)
+	for size in sizes:
+		k = size // 16
+		for rows in frames:
+			pixels = bytearray()
+			for y in range(size):
+				for x in range(size):
+					r, g, b, a = rows[y // k][x // k]
+					pixels += struct.pack("<I", (a << 24) | (r << 16) | (g << 8) | b if a else 0)
+			header = struct.pack("<IIIIIIIII", 36, 0xFFFD0002, size, 1, size, size,
+				hot[0] * k, hot[1] * k, delay)
+			toc.append((0xFFFD0002, size, pos))
+			chunks.append(header + bytes(pixels))
+			pos += len(header) + len(pixels)
+	out = b"Xcur" + struct.pack("<III", 16, 0x10000, len(toc))
+	for typ, subtype, offset in toc:
+		out += struct.pack("<III", typ, subtype, offset)
+	with open(path, "wb") as f:
+		f.write(out + b"".join(chunks))
+
+
+def decode_pointer(kind, body, cluts):
+	if kind == "CURS":
+		return macicons.decode_curs(body)
+	return macicons.decode_crsr(body, cluts=cluts)
+
+
+def write_system_sounds(system_raw, out):
+	"""Write the System file's alert sounds as sounds/system-sound-N.wav, in
+	resource ID order. The installer never picks these as the default alert."""
+	for i, (_rid, body) in enumerate(sorted(system_raw.get("snd ", {}).items())):
+		try:
+			macsnd.snd_to_wav(body, os.path.join(out, "sounds", "system-sound-%d.wav" % (i + 1)))
+		except (ValueError, struct.error):
+			continue
+
+
+def write_pointers(theme_raw, theme_cluts, system_raw, system_cluts, out):
+	"""Write cursors/<name> for every pointer the two sources supply, and an
+	index.theme that inherits everything else from ZacOS9. Returns False when
+	neither source has a pointer (the bundle then keeps ZacOS9's cursors).
+
+	The theme directory's name is the Xcursor theme name the compositor uses."""
+	entries = [(system_raw, system_cluts, kind, ids, names) for kind, ids, names in SYSTEM_POINTERS]
+	entries += [(theme_raw, theme_cluts, "crsr", (rid,), names) for rid, names in THEME_POINTERS]
+	cursor_dir = os.path.join(out, "cursors")
+	written = 0
+	for raw, cluts, kind, ids, names in entries:
+		bodies = raw.get(kind, {})
+		if not all(i in bodies for i in ids):
+			continue
+		frames = []
+		hot = None
+		try:
+			for i in ids:
+				rows, spot = decode_pointer(kind, bodies[i], cluts)
+				frames.append(rows)
+				hot = hot or spot
+		except (ValueError, IndexError, struct.error):
+			continue
+		os.makedirs(cursor_dir, exist_ok=True)
+		delay = POINTER_FRAME_MS if len(frames) > 1 else 0
+		for name in names:
+			write_xcursor(os.path.join(cursor_dir, name), frames, hot, delay, POINTER_SIZES)
+		written += 1
+	if not written:
+		return False
+	with open(os.path.join(out, "index.theme"), "w") as f:
+		f.write("[Icon Theme]\nName=%s\nInherits=ZacOS9\n" % os.path.basename(out.rstrip("/")))
+	return True
+
+
+def pointer_resources(path):
+	"""The pointer resources and colour tables of a System or theme file,
+	as ({type: {id: body}}, {colour count: colours})."""
+	with open(path, "rb") as f:
+		raw = f.read()
+	fork = extract_apple_double(raw) if path.endswith("._") or raw[:4] == b"\x00\x05\x16\x07" else raw
+	items = parse_resource_fork(fork)
+	res = {}
+	cluts = {}
+	for rtype, rid, body in items:
+		res.setdefault(rtype.decode("latin1"), {})[rid] = body
+		if rtype == b"clut":
+			cols = parse_clut(body)
+			cluts.setdefault(len(cols), cols)
+	return res, cluts
+
+
 def write_assets(assets, out):
 	"""Decode PICT/PAT/snd resources into wallpapers, patterns and sounds."""
 	# Wallpapers from PICT.
@@ -348,6 +533,13 @@ def write_assets(assets, out):
 			rows = macpat.decode_pat(body)
 			pngwrite.write_png(os.path.join(out, "patterns", "pattern-%d.png" % (i + 1)), 8, 8, rows)
 		except (ValueError, IndexError):
+			continue
+	# Colour pattern tiles from ppat.
+	for i, body in enumerate(assets.get("ppat", [])):
+		try:
+			w, h, rows = macpat.decode_ppat(body)
+			pngwrite.write_png(os.path.join(out, "patterns", "colour-pattern-%d.png" % (i + 1)), w, h, rows)
+		except (ValueError, IndexError, struct.error):
 			continue
 	# Alert sounds from snd.
 	for i, body in enumerate(assets.get("snd", [])):
@@ -444,10 +636,12 @@ def main():
 	parser.add_argument("--pattern", help="Desktop pattern id")
 	parser.add_argument("--list-cluts", action="store_true", help="Print colour tables from clut resources and exit")
 	parser.add_argument("--auto-colours", action="store_true", help="Heuristically pick chrome colours from the clut resources")
+	parser.add_argument("--system", help="The System file, for its busy, resize, move and hand pointers")
+	parser.add_argument("--dump-icons", action="store_true", help="Decode cicn/crsr/CURS resources to PNG and a text dump")
 	args = parser.parse_args()
 
 	out = os.path.abspath(args.output)
-	for sub in ("icons", "patterns", "sounds", "theme", "boot", "wallpapers"):
+	for sub in ("icons", "patterns", "sounds", "theme", "boot", "wallpapers", "cursors"):
 		os.makedirs(os.path.join(out, sub), exist_ok=True)
 
 	counts = {"icons": 0, "patterns": 0, "sounds": 0, "theme": 0}
@@ -456,6 +650,8 @@ def main():
 	assets = {}
 	scen_tags = {}
 	apple_menu = {}
+	wctb = {}
+	raw_icons = {}
 
 	if args.file:
 		# A single theme file the user copied out of Mac OS 9.
@@ -475,7 +671,7 @@ def main():
 		else:
 			fork = raw
 		if fork and looks_like_resource_fork(fork):
-			process_resource_fork(fork, out, counts, cluts, icons, assets, scen_tags, apple_menu)
+			process_resource_fork(fork, out, counts, cluts, icons, assets, scen_tags, apple_menu, wctb, raw_icons)
 	else:
 		src = args.source
 		if not src:
@@ -502,13 +698,13 @@ def main():
 					if fn.startswith("._"):
 						fork = extract_apple_double(raw)
 						if fork:
-							process_resource_fork(fork, out, counts, cluts, icons, assets, scen_tags, apple_menu)
+							process_resource_fork(fork, out, counts, cluts, icons, assets, scen_tags, apple_menu, wctb, raw_icons)
 							continue
 						# Not AppleDouble after all: fall through.
 
 					# A raw resource fork (not an AppleDouble) when the tail maps back.
 					if looks_like_resource_fork(raw) and not fn.startswith("._"):
-						process_resource_fork(raw, out, counts, cluts, icons, assets, scen_tags, apple_menu)
+						process_resource_fork(raw, out, counts, cluts, icons, assets, scen_tags, apple_menu, wctb, raw_icons)
 						continue
 
 					# Loose asset files.
@@ -532,7 +728,7 @@ def main():
 					with open(full, "rb") as f:
 						raw = f.read()
 					if looks_like_resource_fork(raw):
-						process_resource_fork(raw, out, counts, cluts, icons, assets, scen_tags, apple_menu)
+						process_resource_fork(raw, out, counts, cluts, icons, assets, scen_tags, apple_menu, wctb, raw_icons)
 
 		for s in [src] + expand_archives(src):
 			walk_tree(s)
@@ -542,6 +738,16 @@ def main():
 	# The System file's Apple menu icon (ics8/ics4 id -16386), for themes
 	# the user builds from their own Mac OS 9 install.
 	write_apple_menu(apple_menu, cluts, out)
+	# Pointers: the arrow family from the theme file, the rest from the System file.
+	theme_raw = {k.decode("latin1"): v for k, v in raw_icons.items()}
+	theme_cluts = {}
+	for _rid, cols in cluts:
+		theme_cluts.setdefault(len(cols), cols)
+	system_raw, system_cluts = pointer_resources(args.system) if args.system else ({}, {})
+	write_pointers(theme_raw, theme_cluts, system_raw, system_cluts, out)
+	write_system_sounds(system_raw, out)
+	if args.dump_icons:
+		write_icon_dump(raw_icons, cluts, out)
 	# Decode wallpapers, patterns and sounds.
 	write_assets(assets, out)
 
@@ -633,6 +839,10 @@ def main():
 		if "sbth" in scen_tags:
 			f.write("scroll-bar-thumb=%s\n" %
 				("proportional" if scen_tags["sbth"] == 1 else "normal"))
+		for key in ("window-frame", "window-text", "window-titlebar-light",
+				"window-titlebar-dark", "window-dialog-light", "window-dialog-dark"):
+			if key in wctb:
+				f.write("%s=%s\n" % (key, wctb[key]))
 		if accent:
 			f.write("accent=%s\n" % accent)
 		if highlight:

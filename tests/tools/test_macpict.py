@@ -19,14 +19,21 @@ def test_packbits():
 
 
 def _pict(width, height, op, body):
-    header = bytearray(512)
-    struct.pack_into(">hhhh", header, 2, 0, 0, height, width)
-    return bytes(header) + struct.pack(">H", op) + body + struct.pack(">H", 0x00FF)
+    """A version 1 PICT resource: size, bounds, version opcode, one bitmap
+    opcode with its body, then end-of-picture."""
+    return (struct.pack(">H", 0) + struct.pack(">hhhh", 0, 0, height, width)
+            + b"\x11\x01" + bytes((op,)) + body + b"\xff")
+
+
+def _bitmap_body(rowbytes, width, height, pixels):
+    """BitsRect body: row bytes, bounds, source and destination rects, mode."""
+    return (struct.pack(">H", rowbytes) + struct.pack(">hhhh", 0, 0, height, width)
+            + struct.pack(">hhhh", 0, 0, height, width) * 2 + struct.pack(">H", 0) + pixels)
 
 
 def test_bitsrect():
     # 8x1 1-bit image, one byte 0x80 -> first pixel black.
-    body = struct.pack(">H", 1) + struct.pack(">hhhh", 0, 0, 1, 8) + b"\x80"
+    body = _bitmap_body(1, 8, 1, b"\x80")
     w, h, rows = macpict.decode_pict(_pict(8, 1, 0x0090, body))
     assert (w, h) == (8, 1)
     assert rows[0][0] == (0, 0, 0, 255)
@@ -36,9 +43,15 @@ def test_bitsrect():
 
 def test_packbitsrect():
     # 8x1 1-bit image, one byte 0xFF -> all black.
-    body = struct.pack(">H", 1) + struct.pack(">hhhh", 0, 0, 1, 8) + b"\x00\xff"
+    # Rows narrower than 8 bytes are never packed: 0xFF is eight black pixels.
+    body = _bitmap_body(1, 8, 1, b"\xff")
     w, h, rows = macpict.decode_pict(_pict(8, 1, 0x0098, body))
     assert (w, h) == (8, 1)
+    assert all(px == (0, 0, 0, 255) for px in rows[0])
+    # A packed 8-byte row: count 2, then 0xF9 repeats 0xFF eight times.
+    packed = _bitmap_body(8, 64, 1, bytes((2, 0xF9, 0xFF)))
+    w, h, rows = macpict.decode_pict(_pict(64, 1, 0x0098, packed))
+    assert (w, h) == (64, 1)
     assert all(px == (0, 0, 0, 255) for px in rows[0])
     print("ok    packbitsrect")
 
@@ -72,4 +85,29 @@ test_packbits()
 test_bitsrect()
 test_packbitsrect()
 test_pixmap_24bit()
+
+
+def test_packbits_16bit_units():
+    # Runs count 16-bit pixels: 0x81 repeats the next pixel 128 times, and
+    # 0xCE repeats the one after it 51 times (358 bytes, one 179-pixel row).
+    data = bytes((0x81, 0x00, 0x00, 0xCE, 0x00, 0x00))
+    out = macpict.packbits_decode(data, 358, unit=2)
+    assert len(out) == 358 and out == bytes(358), len(out)
+    lit = macpict.packbits_decode(bytes((0x01, 0x12, 0x34, 0x56, 0x78)), 4, unit=2)
+    assert lit == b"\x12\x34\x56\x78", lit
+    print("ok    16-bit packbits units")
+
+
+def test_component_packed_32bit():
+    # Two pixels, red first then green then blue: (255,0,0) and (0,255,0).
+    # The scan line is one PackBits stream of six plane bytes: a literal of 6.
+    line = bytes((5, 255, 0, 0, 255, 0, 0))
+    data = bytes((len(line),)) + line
+    row = macpict._component_rows(data, 0, 1, 8, 2, 3)[0]
+    assert row[:8] == bytes((0, 255, 0, 0, 0, 0, 255, 0)), row[:8].hex()
+    print("ok    component-packed 32-bit row")
+
+
+test_packbits_16bit_units()
+test_component_packed_32bit()
 print("OK")

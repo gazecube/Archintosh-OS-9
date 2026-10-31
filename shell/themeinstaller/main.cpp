@@ -19,6 +19,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QStringList>
 #include <QSaveFile>
 #include <QTextStream>
 #include <cstdio>
@@ -48,7 +49,8 @@ static bool bundleHasTheme(const QString &name) {
 }
 
 /* Run the extractor and wait with processEvents() (never waitForFinished). */
-static bool runExtractor(const QString &file, const QString &name, QString *error) {
+static bool runExtractor(const QString &file, const QString &name, const QString &system,
+		QString *error) {
 	const QString tool = extractorPath();
 	if (!QFileInfo(tool).isFile()) {
 		*error = "The theme extractor couldn't be found.";
@@ -56,8 +58,12 @@ static bool runExtractor(const QString &file, const QString &name, QString *erro
 	}
 	QProcess process;
 	process.setProgram("python3");
-	process.setArguments({ tool, "--file", file, "--output", outputDir(name), "--name", name,
-		"--auto-colours" });
+	QStringList args { tool, "--file", file, "--output", outputDir(name), "--name", name,
+		"--auto-colours" };
+	if (!system.isEmpty()) {
+		args << "--system" << system;
+	}
+	process.setArguments(args);
 	process.start();
 	/* Qt/Wayland deadlocks on waitForFinished(): pump events until it exits. */
 	QEventLoop loop;
@@ -195,13 +201,74 @@ static void installThemeAssets(const QString &name, QString *wallpaper,
 			const QString id = prefix + "-" + file.completeBaseName();
 			QFile::copy(file.filePath(), dest + "/" + id + "." + file.suffix());
 		}
-		if (!files.isEmpty()) {
-			const QString id = prefix + "-" + files.first().completeBaseName();
+		/* The System's own alert sounds are offered, never chosen as the theme's. */
+		for (const QFileInfo &file : files) {
+			if (f.sub == QStringLiteral("sounds") && file.fileName().startsWith("system-")) {
+				continue;
+			}
+			const QString id = prefix + "-" + file.completeBaseName();
 			if (f.sub == QStringLiteral("wallpapers")) *wallpaper = id;
 			else if (f.sub == QStringLiteral("patterns")) *pattern = id;
 			else *alert = id;
+			break;
 		}
 	}
+}
+
+/* Copy a folder tree, keeping its AppleDouble (._) companions. */
+static bool copyTree(const QString &src, const QString &dst) {
+	if (!QDir().mkpath(dst)) {
+		return false;
+	}
+	bool ok = true;
+	const QFileInfoList entries = QDir(src).entryInfoList(
+		QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot | QDir::System, QDir::Name);
+	for (const QFileInfo &e : entries) {
+		if (e.fileName() == ".DS_Store") {
+			continue;
+		}
+		const QString target = dst + "/" + e.fileName();
+		if (e.isDir()) {
+			ok = copyTree(e.filePath(), target) && ok;
+		} else {
+			QFile::remove(target);
+			ok = QFile::copy(e.filePath(), target) && ok;
+		}
+	}
+	return ok;
+}
+
+/* Copy every Mac OS 9 sound set (file or folder, with its ._ companion) from
+ * the Sound Sets folder into Sound Themes. The shell then applies each set
+ * through its own sdid/snd# mapping, as Mac OS 9 does. Returns the count. */
+static int copyMacSoundSets(const QString &src, const QString &dst) {
+	int count = 0;
+	const QFileInfoList entries = QDir(src).entryInfoList(
+		QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot | QDir::System, QDir::Name);
+	for (const QFileInfo &e : entries) {
+		const QString name = e.fileName();
+		if (name == ".DS_Store" || name.startsWith("._")) {
+			continue;
+		}
+		bool ok;
+		if (e.isDir()) {
+			ok = copyTree(e.filePath(), dst + "/" + name);
+		} else {
+			QDir().mkpath(dst);
+			QFile::remove(dst + "/" + name);
+			ok = QFile::copy(e.filePath(), dst + "/" + name);
+		}
+		if (!ok) {
+			continue;
+		}
+		count++;
+		const QString companion = "._" + name;
+		if (QFileInfo::exists(src + "/" + companion)) {
+			QFile::remove(dst + "/" + companion);
+			QFile::copy(src + "/" + companion, dst + "/" + companion);
+		}
+	}
+	return count;
 }
 
 int main(int argc, char *argv[]) {
@@ -211,12 +278,13 @@ int main(int argc, char *argv[]) {
 	QGuiApplication::setDesktopFileName("zacos9-themeinstaller");
 
 	/* Non-interactive (and testable): --file PATH [--name NAME]. */
-	QString file, name;
+	QString file, name, system;
 	bool batch = false;
 	for (int i = 1; i < argc; i++) {
 		const QString a = QString::fromLocal8Bit(argv[i]);
 		if (a == "--file" && i + 1 < argc) { file = QString::fromLocal8Bit(argv[++i]); batch = true; }
 		else if (a == "--name" && i + 1 < argc) { name = QString::fromLocal8Bit(argv[++i]); batch = true; }
+		else if (a == "--system" && i + 1 < argc) { system = QString::fromLocal8Bit(argv[++i]); }
 		else if (!a.startsWith("--")) { file = a; }
 	}
 
@@ -246,9 +314,17 @@ int main(int argc, char *argv[]) {
 	}
 	name = name.trimmed();
 	const QString fork = resolveResourceFork(file);
+	/* The System file supplies the busy, resize, move and hand pointers. */
+	if (system.isEmpty()) {
+		const QString home = QDir::homePath() + "/Classic/System/System";
+		if (QFileInfo::exists(home)) {
+			system = home;
+		}
+	}
+	const QString systemFork = system.isEmpty() ? QString() : resolveResourceFork(system);
 
 	QString error;
-	if (!runExtractor(fork, name, &error)) {
+	if (!runExtractor(fork, name, systemFork, &error)) {
 		if (batch) {
 			fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(error));
 			return 2;
@@ -274,6 +350,10 @@ int main(int argc, char *argv[]) {
 	}
 	QString wallpaper, pattern, alert;
 	installThemeAssets(name, &wallpaper, &pattern, &alert);
+	const QString soundThemes = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+		"/zacos9/appearance/Sound Themes";
+	const int soundSets = copyMacSoundSets(
+		QDir::homePath() + "/Classic/Appearance add-ons/Sound Sets", soundThemes);
 	const QString presetId = writeAppearancePreset(name, wallpaper, pattern, alert, &error);
 	if (presetId.isEmpty()) {
 		if (batch) {
@@ -287,7 +367,7 @@ int main(int argc, char *argv[]) {
 	pl_setting_set("theme-bundle", name.toUtf8().constData());
 	zac_theme_apply();
 	if (batch) {
-		printf("installed %s\n", qPrintable(outputDir(name)));
+		printf("installed %s (%d sound sets)\n", qPrintable(outputDir(name)), soundSets);
 		return 0;
 	}
 	QMessageBox::information(nullptr, "Theme Installer",

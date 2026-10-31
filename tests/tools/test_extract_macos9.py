@@ -117,6 +117,98 @@ def test_clut_positional():
     print("ok    positional clut lookup")
 
 
+def test_wctb():
+    w = struct.pack(">6sH", b"\x00" * 6, 1) + struct.pack(">HHHH", 1, 0xFFFF, 0xCCCC, 0x9999) \
+        + struct.pack(">HHHH", 7, 0xEEEE, 0xEEEE, 0xEEEE)
+    out = tool.decode_wctb(w)
+    assert out["window-frame"] == "ffcc99", out
+    assert out["window-titlebar-light"] == "eeeeee", out
+    print("ok    window colour table decoded")
+
+
+def test_cicn():
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("macicons", os.path.join(os.path.dirname(sys.argv[1]), "macicons.py"))
+    mi = _iu.module_from_spec(spec); spec.loader.exec_module(mi)
+    # 16x16 4-bit icon: PixMap + mask BitMap + bitmap BitMap + 4-byte handle
+    # + mask data + bitmap data + ctab + pixel data.
+    pixmap = struct.pack(">IHhhhhHHIIIHHHHIII", 0, 0x8008, 0, 0, 16, 16,
+                         0, 0, 0, 72 << 16, 72 << 16, 0, 4, 1, 4, 0, 0, 0)
+    bit_hdr = struct.pack(">IHhhhh", 0, 2, 0, 0, 16, 16)  # 1-bit BitMap, 2 bytes/row
+    handle = struct.pack(">I", 0)
+    mask = b"\xff" * 32            # 2 bytes/row * 16, all opaque
+    bitmap = b"\x00" * 32          # 1-bit B&W copy, skipped by decoder
+    ctab = struct.pack(">IHH", 0, 0, 1) + struct.pack(">HHHH", 0, 0, 0, 0) \
+        + struct.pack(">HHHH", 1, 0xFFFF, 0xFFFF, 0xFFFF)
+    pixel = b"\x11" * 128          # index 1 (white)
+    rows = mi.decode_cicn(pixmap + bit_hdr + bit_hdr + handle + mask + bitmap + ctab + pixel)
+    assert len(rows) == 16 and len(rows[0]) == 16, "16x16 rows"
+    assert rows[0][0] == (255, 255, 255, 255), rows[0][0]
+    print("ok    cicn decoded")
+
+
+def test_pointers():
+    import importlib.util as _iu
+    import tempfile as _tf
+    spec = _iu.spec_from_file_location("macicons", os.path.join(os.path.dirname(sys.argv[1]), "macicons.py"))
+    mi = _iu.module_from_spec(spec); spec.loader.exec_module(mi)
+    # A 'CURS': 16 rows of data, 16 rows of mask, hot spot (v, h) = (3, 5).
+    # Pixel 0 is black (data and mask), pixel 1 is white (mask only).
+    curs = bytearray(68)
+    curs[0] = 0x80
+    curs[32] = 0xC0
+    struct.pack_into(">hh", curs, 64, 3, 5)
+    rows, hot = mi.decode_curs(bytes(curs))
+    assert hot == (5, 3), hot
+    assert rows[0][0] == (0, 0, 0, 255), rows[0][0]
+    assert rows[0][1] == (255, 255, 255, 255), rows[0][1]
+    assert rows[0][2][3] == 0, "unmasked pixel is transparent"
+    # A 'crsr' (16x16, 4-bit, embedded two-entry colour table): all pixels index 1, white.
+    crsr = bytearray(298)
+    struct.pack_into(">HII", crsr, 0, 0x8001, 96, 170)
+    struct.pack_into(">IHhhhhHHIIIHHHHIII", crsr, 96, 0, 0x8008, 0, 0, 16, 16,
+                     0, 0, 0, 72 << 16, 72 << 16, 0, 4, 1, 4, 0, 0, 0)
+    struct.pack_into(">IHH", crsr, 146, 0, 0, 1)
+    struct.pack_into(">HHHH", crsr, 154, 0, 0, 0, 0)
+    struct.pack_into(">HHHH", crsr, 162, 1, 0xFFFF, 0xFFFF, 0xFFFF)
+    crsr[170:298] = b"\x11" * 128
+    struct.pack_into(">hh", crsr, 84, 3, 5)
+    theme_raw = {"crsr": {128: bytes(crsr)}}
+    system_raw = {"CURS": {i: bytes(curs) for i in range(-20721, -20714)}}
+    with _tf.TemporaryDirectory() as out:
+        assert tool.write_pointers(theme_raw, {}, system_raw, {}, out)
+        cursors = os.path.join(out, "cursors")
+        with open(os.path.join(cursors, "watch"), "rb") as f:
+            blob = f.read()
+        assert blob[:4] == b"Xcur"
+        assert struct.unpack("<I", blob[12:16])[0] == 7 * 3, "7 frames at 16, 32 and 48 px"
+        assert os.path.isfile(os.path.join(cursors, "wait"))
+        assert os.path.isfile(os.path.join(cursors, "default")), "arrow from the theme's crsr 128"
+        assert not os.path.exists(os.path.join(cursors, "left_side")), "no CURS -20852 supplied"
+        with open(os.path.join(out, "index.theme")) as f:
+            assert "Inherits=ZacOS9" in f.read()
+    with _tf.TemporaryDirectory() as out:
+        assert not tool.write_pointers({}, {}, {}, {}, out), "no pointers"
+    print("ok    pointers written")
+
+
+def test_system_sounds():
+    import wave
+    # A format 1 snd: one buffer command, a standard header, then 4 samples.
+    head = struct.pack(">HHHI", 1, 1, 5, 0) + struct.pack(">H", 1)
+    head += struct.pack(">HHI", 0x8051, 0, len(head) + 8)
+    header = struct.pack(">IIIII", 0, 4, 22050 << 16, 0, 0) + struct.pack(">BB", 0, 60)
+    snd = head + header + bytes((128, 200, 56, 128))
+    with tempfile.TemporaryDirectory() as out:
+        os.makedirs(os.path.join(out, "sounds"))
+        tool.write_system_sounds({"snd ": {2: snd, 1: snd}}, out)
+        names = sorted(os.listdir(os.path.join(out, "sounds")))
+        assert names == ["system-sound-1.wav", "system-sound-2.wav"], names
+        with wave.open(os.path.join(out, "sounds", "system-sound-1.wav")) as reader:
+            assert reader.getnframes() == 4 and reader.getsampwidth() == 1
+    print("ok    system sounds written")
+
+
 def test_scen():
     data = build_scen([
         (b"name", b"\x0bConvergence"),
@@ -143,5 +235,9 @@ def test_scen():
 test_parse()
 test_end_to_end()
 test_clut_positional()
+test_wctb()
+test_cicn()
 test_scen()
+test_pointers()
+test_system_sounds()
 print("OK")
