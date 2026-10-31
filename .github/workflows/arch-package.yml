@@ -82,12 +82,14 @@ jobs:
               chown -R builder:builder /work/ci-artifacts /tmp/pkg-wlroots /tmp/pkg-archintosh
 
               cp -a /work/packaging/arch/wlroots0.18/. /tmp/pkg-wlroots/
+              chown -R builder:builder /tmp/pkg-wlroots
               cd /tmp/pkg-wlroots
               sudo -u builder env PKGDEST=/work/ci-artifacts makepkg --syncdeps --noconfirm --cleanbuild
               sudo pacman -U --noconfirm /work/ci-artifacts/wlroots0.18-*.pkg.tar.zst
 
               cp -a /work/packaging/arch/PKGBUILD \
                 /work/packaging/arch/fontconfig-freetype-header.patch /tmp/pkg-archintosh/
+              chown -R builder:builder /tmp/pkg-archintosh
               cd /tmp/pkg-archintosh
               sudo -u builder env PKGDEST=/work/ci-artifacts \
                 ARCHINTOSH_VERSION="$ARCHINTOSH_VERSION" \
