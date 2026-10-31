@@ -12,71 +12,52 @@ spec.loader.exec_module(tool)
 
 
 def build_resource_fork(resources):
-    """Build a minimal valid resource fork from [(type, id, body)].
+    """Build a valid resource fork from [(type, id, body)].
 
-    Format: 16-byte header (data_off=256, map_off, data_len, map_len),
-    then 256 bytes of padding (header area), then resource data (each body
-    prefixed by 4-byte length), then the resource map.
-    """
-    # Build resource data (each prefixed by 4-byte length)
+    Header (data_off, map_off, data_len, map_len), then the data section
+    (each resource prefixed by a 4-byte length), then the resource map whose
+    reference entries carry each resource's real data offset."""
+    data_offset = 256
     data = b""
+    offsets = []
     for rtype, res_id, body in resources:
+        offsets.append((rtype, res_id, len(data)))
         data += struct.pack(">I", len(body)) + body
 
-    # Type list
     from collections import OrderedDict
     type_counts = OrderedDict()
     for rtype, res_id, body in resources:
         type_counts.setdefault(rtype, 0)
         type_counts[rtype] += 1
 
-    type_list = struct.pack(">H", len(type_counts) - 1)
+    # Type list: num types, then per type: type(4), num-1(2), ref-list offset(2)
+    # (offset relative to the start of the type list).
     header_size = 2 + 8 * len(type_counts)
     cursor = header_size
-    ref_blobs = {}
+    type_list = struct.pack(">H", len(type_counts) - 1)
     for rtype, count in type_counts.items():
-        ref_off = cursor
-        type_list += struct.pack(">4sH H", rtype, count - 1, ref_off)
-        cursor += 2 + 12 * count  # count field + entries
-    for rtype, count in type_counts.items():
-        ref_list = struct.pack(">H", count - 1)
-        # Need resource IDs; use sequential indices
-        idx = 0
-        for r, rid, body in resources:
-            if r == rtype:
-                ref_list += struct.pack(">H", rid)  # res_id
-                ref_list += struct.pack(">H", 0xFFFF)  # no name
-                ref_list += bytes([0])  # attrs
-                # data offset (3 bytes, relative to data section start)
-                # We need to compute the offset. For simplicity, use 0.
-                ref_list += struct.pack(">I", 0)[1:]  # 3 bytes
-                ref_list += struct.pack(">I", 0)  # reserved
-                idx += 1
-        type_list += ref_list
+        type_list += struct.pack(">4sHH", rtype, count - 1, cursor)
+        cursor += 12 * count
 
-    # Resource map
-    data_section_start = 256
-    data_section = b"\x00" * (256 - len(data) % 256) + data if len(data) < 256 else data
-    # Actually, let's just place data at offset 256
-    data_section = b"\x00" * 256 + data
-    map_offset = len(data_section)
+    # Reference lists (no leading count: each is `count` 12-byte entries).
+    for rtype, count in type_counts.items():
+        for rt, rid, off in offsets:
+            if rt != rtype:
+                continue
+            type_list += struct.pack(">h", rid)
+            type_list += struct.pack(">H", 0xFFFF)  # no name
+            type_list += bytes([0])                 # attributes
+            type_list += struct.pack(">I", off)[1:] # 3-byte data offset
+            type_list += struct.pack(">I", 0)       # reserved
+
     map_size = 28 + len(type_list)
-    map_header = struct.pack(">IIII", data_section_start, map_offset, len(data), map_size)
-    map_info = struct.pack(">I H H", 0, 0, 0)  # next map, file ref, attrs
     name_list_offset = 28 + len(type_list)
-    map_ = (map_header + map_info
-            + struct.pack(">HH", 28, name_list_offset)
-            + type_list)
+    map_header = struct.pack(">IIII", data_offset, data_offset + len(data), len(data), map_size)
+    map_info = struct.pack(">IHH", 0, 0, 0)       # next map, file ref, attrs
+    map_ = map_header + map_info + struct.pack(">HH", 28, name_list_offset) + type_list
 
-    # The data offsets in reference entries need to be correct.
-    # Let me recompute them properly.
-    # Actually, the sequential parsing in parse_resource_fork doesn't use
-    # the reference list offsets — it walks the data section sequentially.
-    # So the reference list offsets don't matter for our parser.
-    # But the data section must start at data_offset (256).
-
-    # full file: 16-byte header + 240 bytes padding + data + map
-    return map_header + b"\x00" * 240 + data + map_
+    return struct.pack(">IIII", data_offset, data_offset + len(data), len(data), map_size) \
+        + b"\x00" * (data_offset - 16) + data + map_
 
 
 def test_parse():
@@ -105,11 +86,58 @@ def test_end_to_end():
     assert os.path.isfile(os.path.join(out, "icons", "a.png"))
     assert any(fn.startswith("icns_") for fn in os.listdir(os.path.join(out, "icons"))), \
         "resource-fork icon extracted"
-    assert any(fn.startswith("thme_") for fn in os.listdir(os.path.join(out, "theme"))), \
-        "resource-fork theme extracted"
+    thme_files = [fn for fn in os.listdir(os.path.join(out, "theme")) if fn.startswith("thme_")]
+    assert thme_files, "resource-fork theme extracted"
+    with open(os.path.join(out, "theme", thme_files[0]), "rb") as f:
+        assert f.read() == b"thmedata", "theme body is the full resource"
     print("ok    end-to-end bundle build")
+
+
+def build_scen(items):
+    """Build a flattened Appearance collection from [(tag, value_bytes)]."""
+    import struct as _s
+    header = _s.pack(">III", 0x00010000, 0x40000000, len(items))
+    headers = b""
+    pool = b""
+    offs = []
+    for tag, value in items:
+        offs.append(len(pool))
+        headers += _s.pack(">4sIII", tag, 0, 0x40000000, len(pool))
+        pool += value
+    return header + headers + _s.pack(">I", len(pool)) + pool
+
+
+def test_clut_positional():
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("macicons", os.path.join(os.path.dirname(sys.argv[1]), "macicons.py"))
+    mi = _iu.module_from_spec(spec); spec.loader.exec_module(mi)
+    # System-file colour tables leave the ctEntry index 0 and use order.
+    lookup = mi.clut_lookup([(0, (255, 0, 0)), (0, (0, 255, 0)), (0, (0, 0, 255))])
+    assert lookup == [(255, 0, 0), (0, 255, 0), (0, 0, 255)], lookup
+    print("ok    positional clut lookup")
+
+
+def test_scen():
+    data = build_scen([
+        (b"name", b"\x0bConvergence"),
+        (b"coll", b"\x00"),
+        (b"smoo", b"\x01"),
+        (b"vfsz", struct.pack(">h", 10)),
+        (b"smos", struct.pack(">H", 12)),
+        (b"hcol", struct.pack(">HHH", 0x9999, 0xCCCC, 0xFFFF)),
+    ])
+    tags = tool.decode_scen_collection(data)
+    assert tags["name"] == "Convergence", tags
+    assert tags["coll"] is False, tags
+    assert tags["smoo"] is True, tags
+    assert tags["vfsz"] == 10, tags
+    assert tags["smos"] == 12, tags
+    assert tags["hcol"] == (0x9999, 0xCCCC, 0xFFFF), tags
+    print("ok    scen collection decoded")
 
 
 test_parse()
 test_end_to_end()
+test_clut_positional()
+test_scen()
 print("OK")

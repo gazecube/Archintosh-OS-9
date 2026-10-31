@@ -1,3 +1,30 @@
+zacos9 (1.6.1) trixie; urgency=medium
+
+  * Theme Installer asks for the theme file and inherits its name.
+
+ -- adamjlawson-ctrl <adamjlawson@gmail.com>  Fri, 30 Oct 2026 15:39:28 -0400
+
+zacos9 (1.6.0) trixie; urgency=medium
+
+  * Mac OS 9 theming: Theme Installer extracts the menu icon, boot art,
+    window colours, wallpapers, patterns and sounds from your own Mac OS 9
+    install.
+
+ -- adamjlawson-ctrl <adamjlawson@gmail.com>  Fri, 30 Oct 2026 14:33:08 -0400
+
+zacos9 (1.5.2) trixie; urgency=medium
+
+  * Theme Installer installs into Appearance > Themes and applies the
+    theme's colours.
+
+ -- adamjlawson-ctrl <adamjlawson@gmail.com>  Fri, 30 Oct 2026 12:55:21 -0400
+
+zacos9 (1.5.1) trixie; urgency=medium
+
+  * Seed the Theme Installer into the Zac menu for existing users.
+
+ -- adamjlawson-ctrl <adamjlawson@gmail.com>  Fri, 30 Oct 2026 11:20:33 -0400
+
 zacos9 (1.5.0) trixie; urgency=medium
 
   * Add the theming feature: theme bundles, a Mac OS 9 theme extractor and
