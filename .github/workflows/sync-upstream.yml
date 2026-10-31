@@ -1,0 +1,29 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  fast-forward:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fast-forward from ZacOS 9 upstream
+        run: |
+          git remote add upstream https://github.com/chromasystemprofessional/Zac-OS-9.git
+          git fetch upstream main
+          git switch main
+          git merge --ff-only upstream/main
+          git push origin main
