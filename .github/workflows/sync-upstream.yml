@@ -25,5 +25,7 @@ jobs:
           git remote add upstream https://github.com/chromasystemprofessional/Zac-OS-9.git
           git fetch upstream main
           git switch main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git merge --no-edit upstream/main
           git push origin main
