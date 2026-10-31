@@ -68,11 +68,12 @@ jobs:
           ARCHINTOSH_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           mkdir -p ci-artifacts
-          docker run --rm \
+          docker run --rm -i \
             -e ARCHINTOSH_VERSION \
             -e ARCHINTOSH_COMMIT \
             -v "$GITHUB_WORKSPACE:/work" \
             archlinux:base-devel bash -euo pipefail -c '
+              set -x
               pacman -Syu --noconfirm
               pacman -S --needed --noconfirm sudo git
               useradd --create-home builder
