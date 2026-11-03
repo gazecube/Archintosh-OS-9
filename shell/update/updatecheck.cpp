@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QStandardPaths>
 
 #ifdef ZACOS9_ARCH_PACKAGE
 static const char DEFAULT_REPO[] = "gazecube/Archintosh-OS-9";
@@ -140,6 +141,30 @@ QString installedVersion(const QString &package) {
 	}
 	return out.section('\t', 1);
 #endif
+}
+
+QString whatsnewNotesDir() {
+	const QString env = qEnvironmentVariable("ZACOS9_WHATSNEW_DIR");
+	return env.isEmpty() ? QStringLiteral("/usr/share/zacos9/whatsnew") : env;
+}
+
+QString whatsnewNotesFile(const QString &version) {
+	return whatsnewNotesDir() + "/" + version + ".txt";
+}
+
+QString whatsnewSeenFile() {
+	return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) +
+		"/zacos9/whatsnew-seen";
+}
+
+bool whatsnewShouldShow(const QString &installed, const QString &seen) {
+	if (installed.isEmpty()) {
+		return false;
+	}
+	if (seen.isEmpty()) {
+		return true;
+	}
+	return versionNewer(installed, seen);
 }
 
 QString debArchitecture() {

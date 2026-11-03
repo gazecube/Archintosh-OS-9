@@ -34,6 +34,7 @@
 #include "idle_policy.h"
 #include "server.h"
 #include "settings.h"
+#include "theme.h"
 
 /* ---- keyboard ---------------------------------------------------------- */
 
@@ -1437,10 +1438,30 @@ static void keyboard_focus_change(struct wl_listener *listener, void *data) {
 	constraint_update(server);
 }
 
+/* The pointer theme: the bundle's own Macintosh set first (decoded plus
+ * hand-placed art the resources alone cannot supply, like the ROM-only
+ * arrow), then a bundle-named theme, else ZacOS9's. */
+static bool bundle_cursor_theme(char *theme, size_t theme_size);
+static void cursor_theme_pick(char *theme, size_t theme_size, char *dir, size_t dir_size,
+		char *bundle, size_t bundle_size) {
+	if (zac_cursor_theme(theme, theme_size, dir, dir_size)) {
+		const char *old = getenv("XCURSOR_PATH");
+		char path[2 * 4096 + 256];
+		snprintf(path, sizeof(path), "%s%s%s", dir, old ? ":" : "", old ? old : "");
+		setenv("XCURSOR_PATH", path, 1);
+		return;
+	}
+	if (bundle_cursor_theme(bundle, bundle_size)) {
+		snprintf(theme, theme_size, "%.*s", (int)theme_size - 1, bundle);
+		return;
+	}
+	snprintf(theme, theme_size, "%s", ZACOS9_CURSOR_THEME);
+}
+
 /* The ZacOS9 cursor theme (assets/cursors) sits next to our binary in
  * the build tree, or under share/icons when installed. Point Xcursor at
  * it for us and, through the environment, for every client we start. */
-static void use_zacos9_cursors(void) {
+static void use_zacos9_cursors(const char *theme) {
 	char exe[PATH_MAX];
 	ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
 	if (len > 0) {
@@ -1456,7 +1477,7 @@ static void use_zacos9_cursors(void) {
 			setenv("XCURSOR_PATH", path, 1);
 		}
 	}
-	setenv("XCURSOR_THEME", ZACOS9_CURSOR_THEME, 1);
+	setenv("XCURSOR_THEME", theme, 1);
 	char size[8];
 	snprintf(size, sizeof(size), "%d", ZACOS9_CURSOR_SIZE);
 	setenv("XCURSOR_SIZE", size, 1);
@@ -1489,9 +1510,9 @@ static bool bundle_cursor_theme(char *theme, size_t theme_size) {
 void input_init(struct plat_server *server) {
 	server->cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server->cursor, server->output_layout);
-	use_zacos9_cursors();
-	char bundle[NAME_MAX + 1];
-	const char *theme = bundle_cursor_theme(bundle, sizeof(bundle)) ? bundle : ZACOS9_CURSOR_THEME;
+	char theme[64], dir[4096], bundle[NAME_MAX + 1];
+	cursor_theme_pick(theme, sizeof(theme), dir, sizeof(dir), bundle, sizeof(bundle));
+	use_zacos9_cursors(theme);
 	server->cursor_mgr = wlr_xcursor_manager_create(theme, ZACOS9_CURSOR_SIZE);
 	server->cursor_mode = PLAT_CURSOR_PASSTHROUGH;
 	wl_list_init(&server->pointers);

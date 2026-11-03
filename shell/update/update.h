@@ -13,6 +13,14 @@
 
 class QNetworkReply;
 
+class UpdateWindow;
+/* The post-restart What's New window (zacos9-update --whatsnew): the
+ * release notes with buttons that open Theme Files and Appearance. */
+void showWhatsNew(QWidget *parent, const QString &version, const QString &notes);
+/* The --whatsnew mode: show the installed version's notes once, then
+ * record it as seen. No window when there is nothing new to show. */
+int whatsnewRun();
+
 /*
  * Software Update, from the Apple menu: Debian builds check a GitHub .deb
  * and apt updates; Arch builds check the fork's Arch package release and
@@ -55,7 +63,7 @@ private:
 	bool m_zacosUpdated = false;
 	QString m_debPath;       /* downloaded package asset */
 
-	PanelButton m_primary, m_secondary;
+	PanelButton m_primary, m_secondary, m_notes;
 	PanelCheckbox m_daily; /* "update-check": daily, unless "never" */
 	PanelHost m_host{ this };
 	QTimer m_sweep;
@@ -79,7 +87,7 @@ private:
 
 	void setText(const QString &headline, const QString &detail);
 	void setButtons(const QString &primary, const QString &secondary);
-	/* Runs a program; `done` gets its exit code, stdout lines go to `line`. */
+	void showNotes();	/* Runs a program; `done` gets its exit code, stdout lines go to `line`. */
 	void run(const QString &program, const QStringList &args, std::function<void(int)> done,
 		std::function<void(const QString &)> line = {});
 	/* apt's APT::Status-Fd progress, mapped into [from, to] of the bar. */
