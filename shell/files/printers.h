@@ -26,9 +26,12 @@ struct Printer {
 	bool accepting = true;
 	QString reasons;  /* printer-state-reasons, "none" when all is well */
 	bool isDefault = false;
-	bool temporary = false; /* found on the network, not set up yet */
+	bool temporary = false; /* a temporary queue, or found on the network */
+	bool discovered = false; /* found on the network: no queue of its own yet */
 
-	QString shownName() const { return info.isEmpty() ? QString(name).replace('_', ' ') : info; }
+	QString shownName() const {
+		return (info.isEmpty() ? QString(name).replace('_', ' ') : info).simplified();
+	}
 	/* "Idle", "Printing", "Stopped", with a reason if there is one. */
 	QString status() const;
 };
@@ -39,6 +42,7 @@ struct PrintJob {
 	QString state; /* pending, pending-held, processing, processing-stopped, ... */
 	int kilobytes = 0, pagesDone = 0;
 	qint64 created = 0; /* seconds since 1970 */
+	QString reasons; /* job-state-reasons, "none" when all is well */
 
 	bool held() const { return state == "pending-held"; }
 	QString status() const; /* "Waiting", "On hold", "Printing", ... */
@@ -63,7 +67,15 @@ QList<PrintJob> parseJobs(const QString &csv);
 int parseJobId(const QString &lpOut);
 
 /* ---- asking CUPS ---- */
+/* Why CUPS couldn't be asked, after listPrinters() found none ("" when
+ * it answered): "The printing service (CUPS) isn't running." and the
+ * like, for the windows to show instead of "no printer chosen". */
+QString cupsProblem();
 QList<Printer> listPrinters();
+/* One entry per printer, even when it answers over more than one
+ * connection (USB and the network): each group's first printer is the
+ * one to use, the rest are the same printer's other connections. */
+QList<QList<Printer>> printerGroups(const QList<Printer> &printers);
 QString defaultPrinter();
 QList<PrintJob> listJobs(const QString &printer);
 /* Prints each file; the job ids, or an error. */

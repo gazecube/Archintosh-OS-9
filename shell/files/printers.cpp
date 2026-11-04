@@ -2,6 +2,7 @@
 #include "process.h"
 
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusPendingCallWatcher>
@@ -9,6 +10,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QHash>
 #include <QMimeDatabase>
 #include <QProcess>
 #include <QRegularExpression>
@@ -28,7 +30,7 @@ const char *const JOBS_TEST = R"({
 	ATTR uri printer-uri $uri
 	ATTR name requesting-user-name $user
 	ATTR keyword which-jobs not-completed
-	ATTR keyword requested-attributes job-id,job-state,job-name,job-originating-user-name,job-k-octets,job-impressions-completed,time-at-creation
+	ATTR keyword requested-attributes job-id,job-state,job-name,job-originating-user-name,job-k-octets,job-impressions-completed,time-at-creation,job-state-reasons
 	STATUS successful-ok
 	DISPLAY job-id
 	DISPLAY job-state
@@ -37,6 +39,7 @@ const char *const JOBS_TEST = R"({
 	DISPLAY job-k-octets
 	DISPLAY job-impressions-completed
 	DISPLAY time-at-creation
+	DISPLAY job-state-reasons
 }
 )";
 
@@ -52,6 +55,12 @@ struct Result {
 	bool ok = false;
 	QString out, err;
 };
+
+/* Print failures also go to the session log: an alert is gone once it is
+ * dismissed, and a user's report needs something to read. */
+void logFailure(const QString &what, const QString &error) {
+	qWarning().noquote() << "Printing:" << what + ":" << error;
+}
 
 /* Runs it to the end in the C locale, keeping the window drawn. No
  * waitForFinished(): see CLAUDE.md. */
@@ -72,8 +81,17 @@ Result run(const QString &name, const QStringList &args, int timeoutMs = 20000) 
 	if (!r.ok && r.err.isEmpty()) {
 		r.err = p.error() == QProcess::FailedToStart ? name + " isn't installed." : name + " failed.";
 	}
-	// "lp: Error - ..." reads better without the program's name.
-	r.err = r.err.section('\n', -1).remove(QRegularExpression("^\\S+: (Error - )?"));
+	// "lp: Error - ..." reads better without the program's name; keep the
+	// lines after it (CUPS often says why on the next line).
+	QStringList lines;
+	for (const QString &line : r.err.split('\n')) {
+		QString l = line;
+		l.remove(QRegularExpression("^\\S+: (Error - )?"));
+		if (!l.trimmed().isEmpty()) {
+			lines << l.trimmed();
+		}
+	}
+	r.err = lines.join('\n');
 	if (!r.err.isEmpty() && r.err[0].isLower()) {
 		r.err[0] = r.err[0].toUpper();
 	}
@@ -136,14 +154,30 @@ QString Printer::status() const {
 }
 
 QString PrintJob::status() const {
-	if (state == "pending") return "Waiting";
-	if (state == "pending-held") return "On hold";
-	if (state == "processing") return pagesDone > 0 ? QString("Printing page %1").arg(pagesDone + 1) : "Printing";
-	if (state == "processing-stopped") return "Stopped";
-	if (state == "canceled") return "Cancelled";
-	if (state == "aborted") return "Failed";
-	if (state == "completed") return "Done";
-	return state;
+	QString s;
+	if (state == "pending") s = "Waiting";
+	else if (state == "pending-held") s = "On hold";
+	else if (state == "processing") s = pagesDone > 0 ? QString("Printing page %1").arg(pagesDone + 1) : "Printing";
+	else if (state == "processing-stopped") s = "Stopped";
+	else if (state == "canceled") s = "Cancelled";
+	else if (state == "aborted") s = "Failed";
+	else if (state == "completed") s = "Done";
+	else s = state;
+	/* Why a job stopped or failed, in words: out of paper, held for an
+	 * administrator's password... A plain hold says nothing new. */
+	QStringList shown;
+	for (QString r : reasons.split(',', Qt::SkipEmptyParts)) {
+		r = r.trimmed();
+		if (r.isEmpty() || r == "none" || r == "job-hold-until-specified") {
+			continue;
+		}
+		r.remove(QRegularExpression("-(error|warning)$"));
+		shown << r.replace('-', ' ');
+	}
+	if (!shown.isEmpty()) {
+		s += " (" + shown.join(", ") + ")";
+	}
+	return s;
 }
 
 QStringList parsePrinterNames(const QString &lpstatE) {
@@ -158,9 +192,8 @@ QStringList parsePrinterNames(const QString &lpstatE) {
 }
 
 /* Queues CUPS itself knows: `lpstat -p` names each one
- * ("printer <name> is idle. ..."). Anything `lpstat -e` advertises
- * beyond these is a ghost — typically a temporary network queue whose
- * driver never materialised, which accepts no documents. */
+ * ("printer <name> is idle. ..."). A printer found on the network is
+ * advertised by `lpstat -e` before it is here; see listPrinters(). */
 QSet<QString> parseKnownPrinters(const QString &lpstatP) {
 	QSet<QString> out;
 	for (const QString &line : lpstatP.split('\n', Qt::SkipEmptyParts)) {
@@ -258,6 +291,7 @@ QList<PrintJob> parseJobs(const QString &csv) {
 		j.kilobytes = col(f, "job-k-octets").toInt();
 		j.pagesDone = col(f, "job-impressions-completed").toInt();
 		j.created = col(f, "time-at-creation").toLongLong();
+		j.reasons = col(f, "job-state-reasons");
 		out << j;
 	}
 	return out;
@@ -282,23 +316,169 @@ bool isBrowsedQueue(const QString &deviceUri) {
 	return deviceUri.startsWith("implicitclass://");
 }
 
+static QString g_problem;
+
+QString cupsProblem() {
+	return g_problem;
+}
+
+/* The reason CUPS can't be asked, in words when it's a known one. */
+static QString cupsProblemFrom(const QString &error) {
+	if (error.contains("No destinations added", Qt::CaseInsensitive)) {
+		return QString(); /* CUPS is fine; there are simply no printers */
+	}
+	if (error.contains("isn't installed")) {
+		return "The printing service (CUPS) isn't installed.";
+	}
+	if (error.contains("scheduler is not running", Qt::CaseInsensitive) ||
+			error.contains("unable to connect", Qt::CaseInsensitive) ||
+			error.contains("connection refused", Qt::CaseInsensitive)) {
+		return "The printing service (CUPS) isn't running.";
+	}
+	return error;
+}
+
 QList<Printer> listPrinters() {
 	QList<Printer> out;
+	g_problem.clear();
+	const Result advertised = run("lpstat", { "-e" });
+	if (!advertised.ok) {
+		g_problem = cupsProblemFrom(advertised.err);
+		return out;
+	}
 	const QString def = defaultPrinter();
 	const Result known = run("lpstat", { "-p" });
-	const QSet<QString> real = known.ok ? parseKnownPrinters(known.out) : QSet<QString>();
-	for (const QString &name : parsePrinterNames(run("lpstat", { "-e" }).out)) {
-		if (known.ok && !real.contains(name)) {
-			continue; /* advertised but not set up: nothing can print there */
-		}
-		Printer p = printerFrom(name, parseOptions(run("lpoptions", { "-p", name }).out));
+	if (!known.ok) {
+		g_problem = cupsProblemFrom(known.err);
+		return out;
+	}
+	const QSet<QString> real = parseKnownPrinters(known.out);
+	for (const QString &name : parsePrinterNames(advertised.out)) {
+		const QMap<QString, QString> options = parseOptions(run("lpoptions", { "-p", name }).out);
+		Printer p = printerFrom(name, options);
 		if (isBrowsedQueue(p.uri)) {
 			continue;
+		}
+		if (!real.contains(name)) {
+			/* `lpstat -p` leaves out a printer found on the network until
+			 * CUPS makes its temporary queue on the first print. It has a
+			 * device URI but no state yet, and printing to it works — the
+			 * default printer is often one of these. An entry with no
+			 * device behind it is a ghost that accepts nothing. */
+			if (p.uri.isEmpty()) {
+				continue;
+			}
+			p.temporary = true;
+			p.discovered = true;
 		}
 		p.isDefault = name == def;
 		out << p;
 	}
 	return out;
+}
+
+/* A printer's model without CUPS's driver list: "Canon TS8300 series,
+ * driverless, cups-filters 1.28.17" is the same printer either way. */
+static QString modelKey(const Printer &p) {
+	const QString key = p.model.section(',', 0, 0).simplified().toCaseFolded();
+	/* Generic drivers say nothing about which printer this is. */
+	if (key == "unknown" || key == "local raw printer" || key == "raw printer" || key.startsWith("generic ")) {
+		return QString();
+	}
+	return key;
+}
+
+/* What a printer is called without the connection in brackets:
+ * "Canon PIXMA TS8300 (USB)" and "Canon PIXMA TS8300" are one printer. */
+static QString baseKey(const Printer &p) {
+	QString name = p.shownName();
+	name.remove(QRegularExpression("\\s*\\([^)]*\\)\\s*$"));
+	return name.simplified().toCaseFolded();
+}
+
+/* `a` is the better connection for its printer than `b`. */
+static bool betterConnection(const Printer &a, const Printer &b) {
+	if (a.isDefault != b.isDefault) {
+		return a.isDefault; /* where printing already goes */
+	}
+	const bool aStopped = a.state == 5, bStopped = b.state == 5;
+	if (aStopped != bStopped) {
+		return !aStopped; /* a stopped queue can't print; another may */
+	}
+	if (a.discovered != b.discovered) {
+		return !a.discovered; /* a queue CUPS set up beats one it found */
+	}
+	if (a.temporary != b.temporary) {
+		return !a.temporary; /* a permanent queue beats a temporary one */
+	}
+	const auto secure = [](const Printer &p) { return p.uri.startsWith("ipps://"); };
+	if (secure(a) != secure(b)) {
+		return secure(a);
+	}
+	const auto usbService = [](const Printer &p) {
+		return p.shownName().contains("(USB)", Qt::CaseInsensitive);
+	};
+	if (usbService(a) != usbService(b)) {
+		return !usbService(a); /* the printer's own service, not its USB twin */
+	}
+	return false;
+}
+
+QList<QList<Printer>> printerGroups(const QList<Printer> &printers) {
+	/* Only a model with one set-up queue is safe to match discovered
+	 * printers against: with two of the same model, either could be
+	 * either, so they stay apart. */
+	QHash<QString, int> queueCount;
+	for (const Printer &p : printers) {
+		const QString key = modelKey(p);
+		if (!p.discovered && !key.isEmpty()) {
+			queueCount[key]++;
+		}
+	}
+	QList<QList<Printer>> groups;
+	QHash<QString, int> groupOfModel;
+	for (const Printer &p : printers) {
+		if (p.discovered) {
+			continue;
+		}
+		groups << QList<Printer>{ p };
+		const QString key = modelKey(p);
+		if (!key.isEmpty() && queueCount.value(key) == 1) {
+			groupOfModel.insert(key, groups.size() - 1);
+		}
+	}
+	for (const Printer &p : printers) {
+		if (!p.discovered) {
+			continue;
+		}
+		const QString key = modelKey(p);
+		int at = key.isEmpty() ? -1 : groupOfModel.value(key, -1);
+		if (at < 0) {
+			const QString base = baseKey(p);
+			for (int i = 0; i < groups.size() && at < 0 && !base.isEmpty(); ++i) {
+				if (groups[i].first().discovered && baseKey(groups[i].first()) == base) {
+					at = i;
+				}
+			}
+		}
+		if (at < 0) {
+			groups << QList<Printer>{ p };
+		} else {
+			groups[at] << p;
+		}
+	}
+	for (QList<Printer> &group : groups) {
+		int best = 0;
+		for (int i = 1; i < group.size(); ++i) {
+			if (betterConnection(group[i], group[best])) {
+				best = i;
+			}
+		}
+		if (best > 0) {
+			group.move(best, 0);
+		}
+	}
+	return groups;
 }
 
 QList<PrintJob> listJobs(const QString &printer) {
@@ -314,13 +494,28 @@ QList<PrintJob> listJobs(const QString &printer) {
 
 QList<int> printFiles(const QString &printer, const QStringList &files, QString *error) {
 	QList<int> ids;
+	QStringList problems;
 	for (const QString &file : files) {
 		const Result r = run("lp", { "-d", printer, "-t", QFileInfo(file).fileName(), "--", file });
 		if (!r.ok) {
-			*error = r.err;
-			return ids;
+			/* One bad document must not stop the others, and the answer
+			 * must name it: "Not everything could be printed" alone
+			 * leaves the user guessing which. */
+			problems << QFileInfo(file).fileName() + ": " + r.err;
+			logFailure("Could not print " + QFileInfo(file).fileName(), r.err);
+			continue;
 		}
-		ids << parseJobId(r.out);
+		const int id = parseJobId(r.out);
+		if (id > 0) {
+			ids << id;
+		} else {
+			const QString why = "the printer didn't accept it.";
+			problems << QFileInfo(file).fileName() + ": " + why;
+			logFailure("Could not print " + QFileInfo(file).fileName(), why);
+		}
+	}
+	if (!problems.isEmpty()) {
+		*error = problems.join('\n');
 	}
 	return ids;
 }
@@ -328,12 +523,18 @@ QList<int> printFiles(const QString &printer, const QStringList &files, QString 
 bool cancelJob(const QString &printer, int id, QString *error) {
 	const Result r = run("cancel", { printer + "-" + QString::number(id) });
 	*error = r.err;
+	if (!r.ok) {
+		logFailure(QString("Could not cancel %1-%2").arg(printer).arg(id), r.err);
+	}
 	return r.ok;
 }
 
 bool holdJob(const QString &printer, int id, bool hold, QString *error) {
 	const Result r = run("lp", { "-i", printer + "-" + QString::number(id), "-H", hold ? "hold" : "resume" });
 	*error = r.err;
+	if (!r.ok) {
+		logFailure(QString("Could not %1 %2-%3").arg(hold ? "hold" : "resume").arg(printer).arg(id), r.err);
+	}
 	return r.ok;
 }
 
@@ -363,9 +564,15 @@ bool setPrinterEnabled(const QString &printer, bool enabled, QString *error) {
 	waitUntil([&watcher] { return watcher.isFinished(); }, -1);
 	QDBusPendingReply<QString> reply = watcher;
 	if (reply.isError()) {
-		*error = reply.error().name().contains("NotPrivileged") || reply.error().name().contains("NotAuthorized")
-			? QString("Only an administrator can stop or start a printer.")
-			: reply.error().message();
+		if (reply.error().name() == "org.freedesktop.DBus.Error.ServiceUnknown") {
+			*error = "Stopping or starting a printer needs the cups-pk-helper package.";
+		} else if (reply.error().name().contains("NotPrivileged") ||
+				reply.error().name().contains("NotAuthorized")) {
+			*error = "Only an administrator can stop or start a printer.";
+		} else {
+			*error = reply.error().message();
+		}
+		logFailure(enabled ? "Could not start " + printer : "Could not stop " + printer, *error);
 		return false;
 	}
 	*error = reply.value(); /* cups-pk-helper's own error, if any */

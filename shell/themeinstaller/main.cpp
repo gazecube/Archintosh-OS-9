@@ -10,13 +10,16 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QImage>
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QCryptographicHash>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -33,11 +36,7 @@
 
 static QString extractorPath() {
 	/* From a build tree, the source tree's copy; installed, under data dir. */
-	const QString src = sourceTreePath("tools/extract-macos9-theme.py");
-	if (!src.isEmpty() && QFileInfo(src).isFile()) {
-		return src;
-	}
-	return QString::fromUtf8(pl_data_dir()) + "/tools/extract-macos9-theme.py";
+	return themeExtractorPath();
 }
 
 static QString outputDir(const QString &name) {
@@ -51,9 +50,252 @@ static bool bundleHasTheme(const QString &name) {
 	return QFileInfo::exists(outputDir(name) + "/menu-icon.png");
 }
 
+/* The Mac OS 9 System Folder the user copied out of Old Dog. Old Dog
+ * shares the home folder as the Mac's "Unix" volume, so a copy dragged
+ * onto it lands at ~/System Folder; the launcher keeps its Mac files in
+ * ~/Classic, and older installs used ~/Classic/System. The Theme
+ * Installer reads the System file, Desktop Pictures and Fonts from it. */
+static QString macSystemFolder() {
+	const QString home = QDir::homePath();
+	const QString classic = qEnvironmentVariable("ZACOS9_CLASSIC_DIR");
+	QStringList candidates { home + "/Classic/System Folder" };
+	if (!classic.isEmpty()) {
+		candidates << classic + "/System Folder";
+	}
+	candidates << home + "/System Folder" << home + "/Classic/System";
+	for (const QString &dir : candidates) {
+		if (QFileInfo(dir + "/System").isFile() ||
+				QFileInfo(dir + "/.rsrc/System").isFile() ||
+				QFileInfo(dir + "/._System").isFile()) {
+			return dir;
+		}
+	}
+	return QString();
+}
+
+/* zacos9-mac-disks: the Finder's read-only Mac volume mounter (installed
+ * in bindir, or its copy in the tree this program was built from). */
+static QString macDisksTool() {
+	const QString installed = QStandardPaths::findExecutable("zacos9-mac-disks");
+	if (!installed.isEmpty()) {
+		return installed;
+	}
+	for (const QString &candidate : { sourceTreePath("shell/finder/zacos9-mac-disks"),
+			buildTreePath("shell/finder/zacos9-mac-disks") }) {
+		if (!candidate.isEmpty() && QFileInfo(candidate).isExecutable()) {
+			return candidate;
+		}
+	}
+	return QString();
+}
+
+/* Run a program to completion with processEvents() (never waitForFinished). */
+static bool runTool(const QString &program, const QStringList &arguments,
+		QByteArray *output, QString *error) {
+	QProcess process;
+	process.setProgram(program);
+	process.setArguments(arguments);
+	process.start();
+	QEventLoop loop;
+	QObject::connect(&process, &QProcess::finished, &loop, &QEventLoop::quit);
+	QObject::connect(&process, &QProcess::errorOccurred, [&](QProcess::ProcessError e) {
+		if (e == QProcess::FailedToStart) {
+			*error = "Couldn't start " + QFileInfo(program).fileName() + ".";
+			loop.quit();
+		}
+	});
+	loop.exec();
+	if (output) {
+		*output = process.readAllStandardOutput();
+	}
+	if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+		const QString why = QString::fromUtf8(process.readAllStandardError()).trimmed();
+		if (error->isEmpty()) {
+			*error = why.isEmpty() ? "The Mac disk tool failed." : why;
+		}
+		return false;
+	}
+	return true;
+}
+
+/* Old Dog's startup disk: classic.conf's startup-disk entry, else the
+ * first Mac HFS/HFS+ image in the Classic folder. */
+static QString oldDogImage() {
+	const QString conf = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) +
+		"/zacos9/classic.conf";
+	QFile file(conf);
+	if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+		QTextStream in(&file);
+		QString line;
+		while (in.readLineInto(&line)) {
+			if (line.startsWith("startup-disk=")) {
+				const QString path = line.mid(13).trimmed();
+				if (QFileInfo(path).isFile()) {
+					return path;
+				}
+			}
+		}
+	}
+	QString dir = qEnvironmentVariable("ZACOS9_CLASSIC_DIR");
+	if (dir.isEmpty()) {
+		dir = QDir::homePath() + "/Classic";
+	}
+	QDirIterator it(dir, QDir::Files, QDirIterator::Subdirectories);
+	for (int seen = 0; it.hasNext() && seen < 200; seen++) {
+		const QString path = it.next();
+		QFile image(path);
+		if (!image.open(QIODevice::ReadOnly)) {
+			continue;
+		}
+		const QByteArray head = image.read(1026);
+		if (head.size() < 1026) {
+			continue;
+		}
+		/* HFS at 1024 ('BD'), HFS+ ('H+'), HFSX ('HX'), or a partition
+		 * map's driver descriptor ('ER' in block zero). */
+		const QByteArray signature = head.mid(1024, 2);
+		if (signature == "BD" || signature == "H+" || signature == "HX" ||
+				head.left(2) == "ER") {
+			return path;
+		}
+	}
+	return QString();
+}
+
+/* Copy a Mac folder tree, keeping each file's resource fork as the
+ * .rsrc/NAME companion the extractor reads. The kernel's hfs driver puts
+ * a file's fork at NAME/rsrc; a SheepShaver extfs copy keeps .rsrc/. */
+static bool copyMacTree(const QString &source, const QString &destination, QString *error) {
+	if (!QDir().mkpath(destination)) {
+		*error = "Couldn't create " + destination + ".";
+		return false;
+	}
+	const QFileInfoList entries = QDir(source).entryInfoList(
+		QDir::Files | QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+		QDir::Name);
+	for (const QFileInfo &entry : entries) {
+		const QString name = entry.fileName();
+		if (name == ".rsrc" || name == ".finf" || name == ".DS_Store") {
+			continue;
+		}
+		const QString target = destination + "/" + name;
+		if (entry.isDir()) {
+			if (!copyMacTree(entry.filePath(), target, error)) {
+				return false;
+			}
+			continue;
+		}
+		QFile::remove(target);
+		if (!QFile::copy(entry.filePath(), target)) {
+			*error = "Couldn't copy " + name + " out of the Mac disk.";
+			return false;
+		}
+	}
+	/* Resource forks beside the data fork (the kernel's hfs driver). */
+	const QFileInfoList files = QDir(source).entryInfoList(
+		QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
+	for (const QFileInfo &file : files) {
+		const QString fork = file.filePath() + "/rsrc";
+		if (!QFileInfo(fork).isFile()) {
+			continue;
+		}
+		QDir().mkpath(destination + "/.rsrc");
+		const QString target = destination + "/.rsrc/" + file.fileName();
+		QFile::remove(target);
+		if (!QFile::copy(fork, target)) {
+			*error = "Couldn't copy " + file.fileName() + "'s resource fork.";
+			return false;
+		}
+	}
+	/* Or in a .rsrc folder (a copy made through Old Dog's Unix volume). */
+	const QDir forks(source + "/.rsrc");
+	if (forks.exists()) {
+		QDir().mkpath(destination + "/.rsrc");
+		for (const QFileInfo &fork : forks.entryInfoList(QDir::Files | QDir::Hidden, QDir::Name)) {
+			const QString target = destination + "/.rsrc/" + fork.fileName();
+			QFile::remove(target);
+			if (!QFile::copy(fork.filePath(), target)) {
+				*error = "Couldn't copy " + fork.fileName() + "'s resource fork.";
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* Mount Old Dog's disk read-only (zacos9-mac-disks) and copy its System
+ * Folder into ~/Classic, where the Theme Installer looks for it. */
+static bool importSystemFolder(QString *copiedTo, QString *error) {
+	const QString tool = macDisksTool();
+	if (tool.isEmpty()) {
+		*error = "The Mac disk tool (zacos9-mac-disks) isn't installed.";
+		return false;
+	}
+	const QString image = oldDogImage();
+	if (image.isEmpty()) {
+		*error = "Old Dog's startup disk wasn't found. Choose it in the "
+			"Startup Disk control panel first.";
+		return false;
+	}
+	QByteArray output;
+	if (!runTool(tool, { "mount", image }, &output, error)) {
+		return false;
+	}
+	const QJsonObject mounted = QJsonDocument::fromJson(output).object();
+	const QJsonArray paths = mounted.value("paths").toArray();
+	const QJsonArray devices = mounted.value("devices").toArray();
+	const auto release = [&] {
+		for (const QJsonValue &device : devices) {
+			QByteArray ignored;
+			QString why;
+			runTool(tool, { "unmount", device.toString() }, &ignored, &why);
+		}
+	};
+	QString folder;
+	for (const QJsonValue &path : paths) {
+		const QFileInfoList entries = QDir(path.toString()).entryInfoList(
+			QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
+		for (const QFileInfo &entry : entries) {
+			if (entry.fileName().compare("System Folder", Qt::CaseInsensitive) == 0) {
+				folder = entry.filePath();
+				break;
+			}
+		}
+		if (!folder.isEmpty()) {
+			break;
+		}
+	}
+	if (folder.isEmpty()) {
+		*error = "The Mac disk has no System Folder on it.";
+		release();
+		return false;
+	}
+	/* Build the new copy beside the old one, so a failure cannot leave a
+	 * half-copied System Folder where ZacOS will read it. */
+	const QString destination = QDir::homePath() + "/Classic/System Folder";
+	const QString staging = destination + ".new";
+	QDir(staging).removeRecursively();
+	bool ok = copyMacTree(folder, staging, error);
+	if (ok) {
+		QDir(destination).removeRecursively();
+		ok = QDir().rename(staging, destination);
+		if (!ok) {
+			*error = "Couldn't move the copied System Folder into place.";
+		}
+	}
+	if (!ok) {
+		QDir(staging).removeRecursively();
+	}
+	release();
+	if (ok) {
+		*copiedTo = destination;
+	}
+	return ok;
+}
+
 /* Run the extractor and wait with processEvents() (never waitForFinished). */
-static bool runExtractor(const QString &file, const QString &name, const QString &system,
-		const QString &fonts, QString *error) {
+static bool runExtractor(const QString &file, const QString &name, const QString &systemFile,
+		const QString &systemFolder, QString *error) {
 	const QString tool = extractorPath();
 	if (!QFileInfo(tool).isFile()) {
 		*error = "The theme extractor couldn't be found.";
@@ -63,15 +305,21 @@ static bool runExtractor(const QString &file, const QString &name, const QString
 	process.setProgram("python3");
 	QStringList args { tool, "--file", file, "--output", outputDir(name), "--name", name,
 		"--auto-colours" };
-	if (!system.isEmpty()) {
-		args << "--system" << system;
+	if (!systemFile.isEmpty()) {
+		args << "--system" << systemFile;
 	}
-	const QString pictures = QDir::homePath() + "/Classic/System Folder/Appearance/Desktop Pictures";
-	if (QFileInfo::exists(pictures)) {
-		args << "--pictures" << pictures;
-	}
-	if (!fonts.isEmpty()) {
-		args << "--fonts" << fonts;
+	if (!systemFolder.isEmpty()) {
+		/* Everything the theme takes from the user's own Mac OS 9
+		 * install: the Apple menu icon, the busy pointers, the alert
+		 * sounds, the desktop pictures and the fonts. */
+		const QString pictures = systemFolder + "/Appearance/Desktop Pictures";
+		if (QDir(pictures).exists()) {
+			args << "--pictures" << pictures;
+		}
+		const QString fonts = systemFolder + "/Fonts";
+		if (QDir(fonts).exists()) {
+			args << "--fonts" << fonts;
+		}
 	}
 	process.setArguments(args);
 	process.start();
@@ -187,9 +435,12 @@ static QString writeAppearancePreset(const QString &file, const QString &name, c
 	};
 	put("accent", themeConfValue(name, "accent"));
 	put("highlight", themeConfValue(name, "highlight"));
-	put("pattern", pattern);
-	put("wallpaper", wallpaper);
-	put("alert-sound", alert);
+	/* Always, even empty: applying the preset has to drop a previous
+	 * theme's wallpaper and pattern instead of leaving them underneath. */
+	settings.insert("pattern", pattern);
+	settings.insert("wallpaper", wallpaper);
+	settings.insert("background", !wallpaper.isEmpty() ? "wallpaper" : "pattern");
+	settings.insert("alert-sound", alert);
 	put("font-family", fontFamily);
 	put("sound-theme", soundTheme);
 	put("theme-bundle", name);
@@ -277,9 +528,14 @@ static void installThemeAssets(const QString &name, QString *wallpaper,
 		QFileInfoList all = QDir(src).entryInfoList(QDir::Files, QDir::Name);
 		/* Only the decoded assets install: the bundle keeps the raw
 		 * resource dumps (*.bin) alongside for reference, and a preset
-		 * pointing at one fails to apply ("pattern is missing"). */
+		 * pointing at one fails to apply ("pattern is missing"). A
+		 * desktop picture stays whatever the extractor wrote: a PICT is
+		 * decoded to PNG, while a JPEG data fork is copied as it is. */
 		const QStringList keptExt = (f.sub == QStringLiteral("sounds"))
-			? QStringList{ "wav" } : QStringList{ "png" };
+			? QStringList{ "wav" }
+			: (f.sub == QStringLiteral("wallpapers"))
+			? QStringList{ "png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp" }
+			: QStringList{ "png" };
 		QFileInfoList files;
 		for (const QFileInfo &file : all) {
 			if (keptExt.contains(file.suffix(), Qt::CaseInsensitive)) {
@@ -312,17 +568,48 @@ static void installThemeAssets(const QString &name, QString *wallpaper,
 				return ad != bd ? ad : a.fileName() < b.fileName();
 			});
 		}
+		QStringList installed;
 		for (const QFileInfo &file : files) {
 			const QString id = prefix + "-" + file.completeBaseName();
-			QFile::copy(file.filePath(), dest + "/" + id + "." + file.suffix());
+			QString name = id + "." + file.suffix();
+			bool converted = false;
+			if (f.sub == QStringLiteral("wallpapers") &&
+					file.suffix().compare("png", Qt::CaseInsensitive) != 0) {
+				/* The desktop loads a wallpaper as PNG (cairo): convert
+				 * whatever Mac OS 9 held (JPEG, GIF, TIFF, BMP) with
+				 * Qt, so a picture is not skipped for its format. */
+				QImage image(file.filePath());
+				if (!image.isNull()) {
+					const QString png = id + ".png";
+					QFile::remove(dest + "/" + png);
+					if (image.save(dest + "/" + png, "PNG")) {
+						name = png;
+						converted = true;
+					}
+				}
+			}
+			if (!converted) {
+				QFile::remove(dest + "/" + name);
+				QFile::copy(file.filePath(), dest + "/" + name);
+			}
+			/* A previous import may have left the same picture under
+			 * another extension. */
+			for (const char *other : { "png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp" }) {
+				const QString candidate = id + "." + other;
+				if (candidate != name) {
+					QFile::remove(dest + "/" + candidate);
+				}
+			}
+			installed << name;
 		}
 		/* The System's own alert sounds are offered, never chosen as the theme's. */
-		for (const QFileInfo &file : files) {
-			if (f.sub == QStringLiteral("sounds") && file.fileName().startsWith("system-")) {
+		for (int i = 0; i < files.size(); i++) {
+			if (f.sub == QStringLiteral("sounds") &&
+					files[i].fileName().startsWith("system-")) {
 				continue;
 			}
-			const QString id = prefix + "-" + file.completeBaseName();
-			const QString copied = id + "." + file.suffix();
+			const QString copied = installed[i];
+			const QString id = QFileInfo(copied).completeBaseName();
 			if (f.sub == QStringLiteral("wallpapers")) *wallpaper = catalogId("wallpaper", copied);
 			else if (f.sub == QStringLiteral("patterns")) *pattern = catalogId("user", copied);
 			else *alert = id;
@@ -462,6 +749,13 @@ static void stampThemeFileIcon(const QString &file, const QString &name) {
 	if (!writeCustomIconImage(target, icon)) {
 		qWarning() << "Could not stamp the theme file's icon onto" << target;
 	}
+	/* The folder the theme was filed into wears the same icon, so the
+	 * theme is recognisable before its file is opened. */
+	const QString folder = QFileInfo(target).absolutePath();
+	if (folder.startsWith(appearanceThemesFolder() + "/") &&
+			!writeCustomIconImage(folder, icon)) {
+		qWarning() << "Could not stamp the theme's icon onto" << folder;
+	}
 }
 int main(int argc, char *argv[]) {
 	qputenv("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1");
@@ -472,12 +766,25 @@ int main(int argc, char *argv[]) {
 	/* Non-interactive (and testable): --file PATH [--name NAME]. */
 	QString file, name, system;
 	bool batch = false;
+	bool copyFolder = false;
 	for (int i = 1; i < argc; i++) {
 		const QString a = QString::fromLocal8Bit(argv[i]);
 		if (a == "--file" && i + 1 < argc) { file = QString::fromLocal8Bit(argv[++i]); batch = true; }
 		else if (a == "--name" && i + 1 < argc) { name = QString::fromLocal8Bit(argv[++i]); batch = true; }
 		else if (a == "--system" && i + 1 < argc) { system = QString::fromLocal8Bit(argv[++i]); }
+		else if (a == "--copy-system-folder") { copyFolder = true; batch = true; }
 		else if (!a.startsWith("--")) { file = a; }
+	}
+
+	/* Copy Old Dog's System Folder and stop: no theme file needed. */
+	if (copyFolder && file.isEmpty()) {
+		QString copied, why;
+		if (!importSystemFolder(&copied, &why)) {
+			fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(why));
+			return 2;
+		}
+		printf("%s\n", qPrintable(copied));
+		return 0;
 	}
 
 	if (file.isEmpty()) {
@@ -506,19 +813,57 @@ int main(int argc, char *argv[]) {
 	}
 	name = name.trimmed();
 	const QString fork = resolveResourceFork(file);
-	/* The System file supplies the busy, resize, move and hand pointers. */
+	/* The user's own Mac OS 9 System Folder supplies the Apple menu icon,
+	 * the busy pointers, the alert sounds, the desktop pictures and the
+	 * fonts. Old Dog keeps it at ~/Classic/System Folder; a copy dragged
+	 * onto the Mac's Unix volume (the home folder) lands at
+	 * ~/System Folder. --system names a System file directly. */
+	QString systemFolder;
 	if (system.isEmpty()) {
-		const QString home = QDir::homePath() + "/Classic/System/System";
-		if (QFileInfo::exists(home)) {
-			system = home;
+		systemFolder = macSystemFolder();
+		if (systemFolder.isEmpty()) {
+			/* Offer to copy it out of Old Dog's disk, which is the only
+			 * lossless source of the resource forks themes need. */
+			bool want = copyFolder;
+			if (!batch) {
+				want = QMessageBox::question(nullptr, "Theme Installer",
+					"Old Dog's Mac OS 9 System Folder wasn't found.\n\n"
+					"Copy it from Old Dog's disk into your Classic folder? The theme\n"
+					"uses its Apple menu icon, desktop pictures, sounds and fonts.\n"
+					"The disk is mounted read-only; you may be asked for an\n"
+					"administrator's password.",
+					QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) ==
+					QMessageBox::Yes;
+			}
+			if (want) {
+				QString copied, why;
+				if (importSystemFolder(&copied, &why)) {
+					systemFolder = macSystemFolder();
+				} else if (batch) {
+					fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(why));
+				} else {
+					QMessageBox::warning(nullptr, "Theme Installer",
+						"The System Folder couldn't be copied:\n\n" + why +
+						"\n\nThe theme installs without its Apple menu icon, "
+						"pictures, sounds and fonts.");
+				}
+			}
 		}
+		if (!systemFolder.isEmpty()) {
+			for (const QString &candidate : { systemFolder + "/System",
+					systemFolder + "/.rsrc/System", systemFolder + "/._System" }) {
+				if (QFileInfo(candidate).isFile()) {
+					system = candidate;
+					break;
+				}
+			}
+		}
+	} else {
+		systemFolder = QFileInfo(system).absolutePath();
 	}
 	const QString systemFork = system.isEmpty() ? QString() : resolveResourceFork(system);
-
-	/* The Fonts folder supplies the theme's bitmap fonts (Geneva, Chicago...). */
-	const QString fonts = QDir::homePath() + "/Classic/System Folder/Fonts";
 	QString error;
-	if (!runExtractor(fork, name, systemFork, QFileInfo::exists(fonts) ? fonts : QString(), &error)) {
+	if (!runExtractor(fork, name, systemFork, systemFolder, &error)) {
 		if (batch) {
 			fprintf(stderr, "zacos9-themeinstaller: %s\n", qPrintable(error));
 			return 2;
@@ -546,8 +891,11 @@ int main(int argc, char *argv[]) {
 	installThemeAssets(name, &wallpaper, &pattern, &alert);
 	const QString soundThemes = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
 		"/zacos9/appearance/Sound Themes";
-	const int soundSets = copyMacSoundSets(
-		QDir::homePath() + "/Classic/Appearance add-ons/Sound Sets", soundThemes);
+	QString soundSetFolder = systemFolder + "/Appearance/Sound Sets";
+	if (!QDir(soundSetFolder).exists()) {
+		soundSetFolder = QDir::homePath() + "/Classic/Appearance add-ons/Sound Sets";
+	}
+	const int soundSets = copyMacSoundSets(soundSetFolder, soundThemes);
 	const QString soundId = soundThemeId(soundThemes, themeConfValue(name, "sound-set"));
 	const QString fontFamily = installThemeFonts(name);
 	const QString presetId = writeAppearancePreset(file, name, wallpaper, pattern, alert, fontFamily, soundId, &error);
@@ -567,19 +915,21 @@ int main(int argc, char *argv[]) {
 		!pattern.isEmpty() ? "pattern" : "");
 	setThemeConfValue(name, "alert-sound", alert);
 	setThemeConfValue(name, "sound-theme", soundId);
+	/* Drop whatever the previous theme put here when this one supplies
+	 * nothing, so a theme with no desktop picture does not keep the last
+	 * one's wallpaper and pattern underneath its chrome. */
+	const QByteArray patternBytes = pattern.toUtf8();
+	const QByteArray wallpaperBytes = wallpaper.toUtf8();
+	const QByteArray alertBytes = alert.toUtf8();
+	/* A theme's own sound set is applied when it names one; without one,
+	 * the interface sound set the user chose stays. */
 	if (!soundId.isEmpty()) {
 		pl_setting_set("sound-theme", soundId.toUtf8().constData());
 	}
-	if (!pattern.isEmpty()) {
-		pl_setting_set("pattern", pattern.toUtf8().constData());
-	}
-	if (!wallpaper.isEmpty()) {
-		pl_setting_set("wallpaper", wallpaper.toUtf8().constData());
-	}
+	pl_setting_set("pattern", patternBytes.isEmpty() ? nullptr : patternBytes.constData());
+	pl_setting_set("wallpaper", wallpaperBytes.isEmpty() ? nullptr : wallpaperBytes.constData());
 	pl_setting_set("background", !wallpaper.isEmpty() ? "wallpaper" : "pattern");
-	if (!alert.isEmpty()) {
-		pl_setting_set("alert-sound", alert.toUtf8().constData());
-	}
+	pl_setting_set("alert-sound", alertBytes.isEmpty() ? nullptr : alertBytes.constData());
 	pl_setting_set("appearance-theme", presetId.toUtf8().constData());
 	pl_setting_set("theme-bundle", name.toUtf8().constData());
 	stampThemeFileIcon(file, name);
@@ -589,12 +939,35 @@ int main(int argc, char *argv[]) {
 	/* The desktop background and alert sound live in the preset, not
 	 * theme.conf: apply them here so installing a theme repaints the
 	 * desktop, not just its window chrome. */
+	/* What the theme asked for but the user's Mac OS 9 install did not
+	 * supply, so a partial import says so instead of looking broken. */
+	QStringList missing;
+	if (!QFileInfo::exists(outputDir(name) + "/apple-menu.png")) {
+		missing << "Apple menu icon";
+	}
+	if (wallpaper.isEmpty()) {
+		missing << "desktop picture";
+	}
+	if (!QFileInfo::exists(outputDir(name) + "/icons/disk-32.png")) {
+		missing << "hard disk icon";
+	}
+	if (QDir(outputDir(name) + "/fonts").entryList({ "*.ttf" }, QDir::Files).isEmpty()) {
+		missing << "fonts";
+	}
 	zac_theme_apply();
 	if (batch) {
-		printf("installed %s (%d sound sets)\n", qPrintable(outputDir(name)), soundSets);
+		printf("installed %s (%d sound sets", qPrintable(outputDir(name)), soundSets);
+		if (!missing.isEmpty()) {
+			printf("; not found: %s", qPrintable(missing.join(", ")));
+		}
+		printf(")\n");
 		return 0;
 	}
-	QMessageBox::information(nullptr, "Theme Installer",
-		"Theme \"" + name + "\" was installed from your Mac OS 9 folder.");
+	QString message = "Theme \"" + name + "\" was installed from your Mac OS 9 folder.";
+	if (!missing.isEmpty()) {
+		message += "\n\nYour Mac OS 9 System Folder did not supply its " +
+			missing.join(", ") + "; the theme keeps ZacOS's own.";
+	}
+	QMessageBox::information(nullptr, "Theme Installer", message);
 	return 0;
 }

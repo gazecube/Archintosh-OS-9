@@ -103,6 +103,7 @@ FolderWindow *FolderWindow::open(const QString &path) {
 		/* Spatial: the window comes back with its old size, view and place. */
 		w = new FolderWindow(key);
 		openWindows().insert(key, w);
+		Finder::instance().desktopIconsChanged();
 		w->resize(w->m_state.size);
 		w->show();
 		pl_sound_event("window-open");
@@ -208,6 +209,7 @@ FolderWindow::~FolderWindow() {
 		m_state.save(m_path);
 	}
 	openWindows().remove(m_path);
+	Finder::instance().desktopIconsChanged();
 	Finder::instance().viewClosed(this);
 }
 
@@ -1652,7 +1654,10 @@ void FolderWindow::mousePressEvent(QMouseEvent *e) {
 		/* Pressing a selected icon keeps the selection, to drag them all. */
 		forEachItem([&](Item *item) { item->selected = item == hit; });
 	}
-	m_pressItem = hit && hit->selected ? hit : nullptr;
+	/* Pressing a selected icon keeps the selection, to drag them all; a
+	 * plain click that never drags collapses it on release (below). A
+	 * Shift-click is building a selection, so it is never collapsed. */
+	m_pressItem = !extend && hit && hit->selected ? hit : nullptr;
 	m_pressPos = pos;
 	if (!hit && m_mode != ViewMode::Buttons) {
 		m_marquee = true;
@@ -1818,7 +1823,16 @@ void FolderWindow::mouseReleaseEvent(QMouseEvent *) {
 		}
 		return;
 	}
-	m_pressItem = nullptr;
+	if (m_pressItem) {
+		/* A click without a drag on one of several selected rows or icons
+		 * selects only it; a drag (which clears m_pressItem) moves them
+		 * all. */
+		Item *pressed = m_pressItem;
+		m_pressItem = nullptr;
+		forEachItem([&](Item *item) { item->selected = item == pressed; });
+		update();
+		Finder::instance().notifyState();
+	}
 	if (m_marquee) {
 		endMarquee();
 	}

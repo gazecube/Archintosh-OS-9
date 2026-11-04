@@ -281,7 +281,8 @@ with open(_glob.glob(os.path.join(data4, "zacos9", "appearance", "Theme Files", 
     settings4 = _json.load(f)["settings"]
 assert re.fullmatch(r"user:[0-9a-f]{64}:image", settings4.get("pattern", "") or ""), \
     f"preset references the decoded tile by catalog id: {settings4}"
-assert "alert-sound" not in settings4, "no alert without a decodable sound"
+assert settings4.get("alert-sound", "") == "", \
+    "the preset names no alert without a decodable sound (and clears an older one)"
 with open(os.path.join(config4, "zacos9", "desktop.conf")) as f:
     desktop = {}
     for line in f:
@@ -318,8 +319,101 @@ themed = [p["settings"] for p in presets if p["settings"].get("theme-bundle") ==
 assert themed, "a preset for the theme"
 catalog = re.compile(r"\A(user|wallpaper):[0-9a-f]{64}:image\Z")
 for key in ("pattern", "wallpaper"):
-    if key in themed[0]:
+    if themed[0].get(key):
         assert catalog.match(themed[0][key]), (key, themed[0][key])
 print("ok    preset names pattern and wallpaper by catalog id")
+
+# The bundle records the extractor that built it, so a ZacOS update that can
+# decode more rebuilds it instead of keeping the old, partial bundle.
+with open(os.path.join(bundle, "theme.conf")) as f:
+    assert "extractor-sha256=" in f.read(), "bundle records the extractor"
+print("ok    the bundle records the extractor that built it")
+
+# Installing a theme with no desktop picture drops the previous one instead
+# of leaving it underneath the new chrome.
+with open(os.path.join(config3, "zacos9", "desktop.conf"), "a") as f:
+    f.write("wallpaper=wallpaper:old:image\npattern=old-pattern\nbackground=wallpaper\n")
+r = subprocess.run([binary, "--file", aquapath], env=env3,
+                   capture_output=True, text=True, timeout=120)
+assert r.returncode == 0, r.stderr
+with open(os.path.join(config3, "zacos9", "desktop.conf")) as f:
+    conf = f.read()
+assert "wallpaper=" not in conf, conf
+assert "old-pattern" not in conf, conf
+assert "background=pattern" in conf, conf
+print("ok    a theme with no desktop picture drops the previous one")
+
+# A desktop picture in any format the Desktop Pictures folder holds installs
+# as PNG: the desktop loads wallpapers as PNG only, so JPEG, GIF, TIFF and
+# BMP are converted on the way in.
+pics = os.path.join(root, "System Folder", "Appearance", "Desktop Pictures")
+os.makedirs(pics, exist_ok=True)
+def bmp_2x2():
+    header = struct.pack("<2sIHHI", b"BM", 54 + 16, 0, 0, 54)
+    info = struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 24, 0, 16, 2835, 2835, 0, 0)
+    pixels = b"\x00\x00\xff" * 2 + b"\x00\x00" + b"\xff\x00\x00" * 2 + b"\x00\x00"
+    return header + info + pixels
+with open(os.path.join(pics, "Test Picture"), "wb") as f:
+    f.write(bmp_2x2())
+scen6 = build_scen([(b"name", b"\x0cTest Picture"),
+                    (b"dpnm", b"\x0cTest Picture")])
+fork6 = build_fork([
+    (b"icl8", 1024, b"\x00" * 1024),
+    (b"ICN#", 1024, b"\xff" * 128 + b"\xff" * 128),
+    (b"clut", 200, struct.pack(">I", 0) + struct.pack(">HH", 0, 0) + struct.pack(">HHHH", 0, 0, 0, 0)),
+    (b"scen", 2000, scen6),
+])
+picture = os.path.join(src, "Picture Theme")
+with open(picture, "wb") as f:
+    f.write(fork6)
+r = subprocess.run([binary, "--file", picture], env=env3,
+                   capture_output=True, text=True, timeout=120)
+assert r.returncode == 0, r.stderr
+wallpapers = _glob.glob(os.path.join(data3, "zacos9", "appearance", "Wallpaper", "*.png"))
+assert wallpapers, "the BMP desktop picture installed as PNG"
+with open(os.path.join(config3, "zacos9", "desktop.conf")) as f:
+    conf = f.read()
+assert "background=wallpaper" in conf, conf
+print("ok    a desktop picture in any format installs as PNG")
+
+# Old Dog's System Folder can be copied out of its disk image: the installer
+# mounts it read-only through zacos9-mac-disks and keeps the resource forks
+# as the .rsrc companions the extractor reads.
+mount = tempfile.mkdtemp()
+macsf = os.path.join(mount, "System Folder")
+os.makedirs(os.path.join(macsf, ".rsrc"))
+with open(os.path.join(macsf, "System"), "wb") as f:
+    f.write(b"data fork")
+with open(os.path.join(macsf, ".rsrc", "System"), "wb") as f:
+    f.write(b"resource fork")
+pics = os.path.join(macsf, "Appearance", "Desktop Pictures")
+os.makedirs(pics)
+with open(os.path.join(pics, "Picture"), "wb") as f:
+    f.write(b"picture")
+home6 = tempfile.mkdtemp()
+os.makedirs(os.path.join(home6, "Classic"))
+with open(os.path.join(home6, "Classic", "Macintosh HD.dsk"), "wb") as f:
+    f.write(b"\x00" * 1024 + b"BD" + b"\x00" * 2048)
+fakebin = tempfile.mkdtemp()
+tool = os.path.join(fakebin, "zacos9-mac-disks")
+with open(tool, "w") as f:
+    f.write('#!/bin/sh\nif [ "$1" = mount ]; then\n'
+            '  printf \'{"paths":["%s"],"devices":["fake0"]}\\n\' "$FAKE_MOUNT"\nfi\nexit 0\n')
+os.chmod(tool, 0o755)
+env6 = dict(os.environ)
+env6["HOME"] = home6
+env6["PATH"] = fakebin + ":" + env6["PATH"]
+env6["FAKE_MOUNT"] = mount
+env6["QT_QPA_PLATFORM"] = "offscreen"
+r = subprocess.run([binary, "--copy-system-folder"], env=env6,
+                   capture_output=True, text=True, timeout=120)
+assert r.returncode == 0, r.stderr
+copied = os.path.join(home6, "Classic", "System Folder")
+with open(os.path.join(copied, "System"), "rb") as f:
+    assert f.read() == b"data fork", "the data fork is copied"
+with open(os.path.join(copied, ".rsrc", "System"), "rb") as f:
+    assert f.read() == b"resource fork", "the resource fork lands in .rsrc"
+assert os.path.isfile(os.path.join(copied, "Appearance", "Desktop Pictures", "Picture"))
+print("ok    Old Dog's System Folder copies out of its disk with its forks")
 
 print("OK")

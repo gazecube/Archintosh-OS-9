@@ -164,6 +164,46 @@ int main(int argc, char **argv) {
 	}
 	check(usbBadgeDiffers && diskRemainsVisible,
 		"USB volume icon overlays a USB badge on the drive without replacing it");
+	{
+		/* Archives are packages of files, not blank documents. */
+		const std::vector<uint32_t> *zip = documentIcon("application/zip", PL_ICON_LARGE);
+		const std::vector<uint32_t> *sit = documentIcon("application/x-stuffit", PL_ICON_LARGE);
+		Pixels page(PL_ICON_LARGE, PL_ICON_LARGE);
+		pl_icon_paint(&page.c, 0, 0, PL_ICON_DOCUMENT, PL_ICON_LARGE, false);
+		bool differs = false;
+		if (zip && zip->size() == PL_ICON_LARGE * PL_ICON_LARGE) {
+			for (int y = 0; y < PL_ICON_LARGE && !differs; y++) {
+				for (int x = 0; x < PL_ICON_LARGE && !differs; x++) {
+					differs = (*zip)[static_cast<size_t>(y) * PL_ICON_LARGE + x] !=
+						page.img.pixel(x, y);
+				}
+			}
+		}
+		check(zip && sit && zip->size() == PL_ICON_LARGE * PL_ICON_LARGE && zip == sit &&
+				differs, "archives get their own zipped-page icon");
+	}
+	{
+		/* Mac OS 9 dims an open volume's desktop icon: at half strength
+		 * the pattern shows through until its window closes. */
+		Pixels solid(48, 48), dim(48, 48);
+		pl_fill(&solid.c, 0, 0, 47, 47, 0xFF808080u);
+		pl_fill(&dim.c, 0, 0, 47, 47, 0xFF808080u);
+		paintIconItem(&solid.c, regularDisk, 8, 8, true, false, false);
+		paintIconItem(&dim.c, regularDisk, 8, 8, true, false, true);
+		int solidFromBackground = 0, dimFromBackground = 0;
+		for (int y = 8; y < 8 + PL_ICON_LARGE; y++) {
+			for (int x = 8; x < 8 + PL_ICON_LARGE; x++) {
+				const QRgb s = solid.img.pixel(x, y);
+				const QRgb d = dim.img.pixel(x, y);
+				solidFromBackground += qAbs(qRed(s) - 0x80) + qAbs(qGreen(s) - 0x80) +
+					qAbs(qBlue(s) - 0x80);
+				dimFromBackground += qAbs(qRed(d) - 0x80) + qAbs(qGreen(d) - 0x80) +
+					qAbs(qBlue(d) - 0x80);
+			}
+		}
+		check(dimFromBackground < solidFromBackground,
+			"an open volume's desktop icon is drawn at half strength");
+	}
 	for (bool selected : { false, true }) {
 		Pixels desktopDisk(PL_ICON_LARGE, PL_ICON_LARGE);
 		Pixels desktopUsb(PL_ICON_LARGE, PL_ICON_LARGE);
@@ -491,6 +531,27 @@ int main(int argc, char **argv) {
 					desktop.selectedItems().size() == 1,
 				"pressing an icon after a selection rectangle lost its release selects that icon alone");
 			desktop.mouseReleaseEvent(nullptr);
+			desktop.selectByName(QString());
+		}
+		{
+			/* A click (press and release, no drag) on one of several
+			 * selected icons selects only it, as Mac OS 9 did; the press
+			 * alone keeps them so a drag moves them all. */
+			desktop.selectByName(QString());
+			desktop.m_disk->selected = true;
+			desktop.m_trash->selected = true;
+			const QPoint centre = desktop.m_disk->pos + QPoint(PL_ICON_LARGE / 2, PL_ICON_LARGE / 2);
+			QMouseEvent press(QEvent::MouseButtonPress, QPointF(centre), QPointF(centre),
+				Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+			desktop.mousePressEvent(&press);
+			check(desktop.m_disk->selected && desktop.m_trash->selected,
+				"pressing one of several selected desktop icons keeps them for a drag");
+			QMouseEvent release(QEvent::MouseButtonRelease, QPointF(centre), QPointF(centre),
+				Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+			desktop.mouseReleaseEvent(&release);
+			check(desktop.m_disk->selected && !desktop.m_trash->selected &&
+					desktop.selectedItems().size() == 1,
+				"releasing without a drag selects only the clicked desktop icon");
 			desktop.selectByName(QString());
 		}
 		/* A place saved on a bigger screen (Monitors' scale turned back

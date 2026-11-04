@@ -72,8 +72,8 @@ THEME_ICON_MAP = [
     ("trash-empty", b"icl8", -3993),
     ("trash-full", b"icl8", -3984),
     ("document", b"icl8", -4000),
-    ("shared-folder", b"icl8", -3973),
-    ("network-disk", b"icl8", -3970),
+    ("disk", b"icl8", -3995),
+    ("network-disk", b"icl8", -3972),
     ("disk-image", b"icl8", -3998),
     ("caution", b"icl8", 7202),
 ]
@@ -112,6 +112,41 @@ THEME_ICON_IDS = frozenset(
     [(b"ics4", rid) for _kind, _rtype, rid in THEME_ICON_MAP] +
     [(b"ics#", rid) for _kind, _rtype, rid in THEME_ICON_MAP]
 )
+
+
+def decode_standard_icon(theme_icons, palette, rid, size):
+	"""One standard icon at `size` (16 or 32) from whatever the file holds.
+
+	A Mac OS 9 file may carry an icon suite (icns) or any of the colour
+	families (icl8/icl4, ics8/ics4) for the same id; the maps name one
+	type, but the art can be in another. Same order everywhere: suite,
+	then the colour family, then 4-bit, each with its 1-bit mask."""
+	if (b"icns", rid) in theme_icons:
+		try:
+			return macicons.decode_icns(theme_icons[(b"icns", rid)][0], palette, size=size)
+		except (ValueError, IndexError, struct.error):
+			pass
+	if size >= 32:
+		families = ((b"icl8", 1024, macicons.decode_icl8), (b"icl4", 512, macicons.decode_icl4))
+	else:
+		families = ((b"ics8", 256, macicons.decode_icl8), (b"ics4", 128, macicons.decode_icl4))
+	for rtype, expect, decode in families:
+		bodies = theme_icons.get((rtype, rid))
+		if not bodies or len(bodies[0]) != expect:
+			continue
+		try:
+			rows = decode(bodies[0], palette, size=size)
+		except (ValueError, IndexError):
+			continue
+		mask = theme_icons.get((ICON_MASKS[rtype], rid))
+		if mask:
+			try:
+				_, mask_rows = macicons.decode_icn1(mask[0], size=size)
+				rows = macicons.combine_icon(rows, mask_rows)
+			except (ValueError, IndexError):
+				pass
+		return rows
+	return None
 
 
 def decode_theme_icon(theme_icons, palette, color_type, rid, size, expect, prefer_icns=True):
@@ -189,20 +224,12 @@ def write_theme_icons(theme_icons, cluts, out, theme_keys=frozenset(), theme_clu
 	"""
 	sys_palette = macicons.resolve_palette(cluts[len(theme_cluts):] or cluts)
 	icons_dir = os.path.join(out, "icons")
-	for kind, rtype, rid in THEME_ICON_MAP:
-		has_theme_icns = (b"icns", rid) in theme_keys
-		has_theme_big = (rtype, rid) in theme_keys
-		big = decode_theme_icon(theme_icons, sys_palette, rtype, rid, 32,
-			1024 if rtype == b"icl8" else 512,
-			prefer_icns=has_theme_icns or not has_theme_big)
+	for kind, _rtype, rid in THEME_ICON_MAP:
+		big = decode_standard_icon(theme_icons, sys_palette, rid, 32)
 		if big is None:
 			continue
 		pngwrite.write_png(os.path.join(icons_dir, kind + "-32.png"), 32, 32, big)
-		small_type = b"ics8" if rtype == b"icl8" else b"ics4"
-		has_theme_small = (small_type, rid) in theme_keys
-		small = decode_theme_icon(theme_icons, sys_palette, small_type, rid, 16,
-			256 if small_type == b"ics8" else 128,
-			prefer_icns=has_theme_icns or not has_theme_small)
+		small = decode_standard_icon(theme_icons, sys_palette, rid, 16)
 		if small is None:
 			small = pngwrite.nearest_scale(big, 32, 32, 16, 16)
 		pngwrite.write_png(os.path.join(icons_dir, kind + "-16.png"), 16, 16, small)
@@ -218,6 +245,9 @@ def parse_resource_fork(data):
 	offset; where a fork's map is missing or odd, we fall back to reading the
 	data section in order, matching the map's type counts. Returns a list of
 	(type, id, body) tuples."""
+	MAX_MAP_TYPES = 4096
+	MAX_MAP_RESOURCES = 20000
+	MAX_MAP_BYTES = 64 * 1024 * 1024
 	if len(data) < 16:
 		return []
 	data_offset, map_offset, data_length, map_length = struct.unpack(">IIII", data[:16])
@@ -232,7 +262,15 @@ def parse_resource_fork(data):
 		if tl + 2 > len(data):
 			return []
 		items = []
+		total = 0
 		num_types = struct.unpack(">H", data[tl:tl + 2])[0] + 1
+		# A file that is not a resource fork (an AppleDouble header, say)
+		# can still satisfy the offsets above and then name tens of
+		# thousands of types whose reference list reads the same bytes.
+		# Real forks hold far fewer: stop before copying the same body
+		# until the memory runs out.
+		if num_types > MAX_MAP_TYPES:
+			return []
 		pos = tl + 2
 		for _ in range(num_types):
 			if pos + 8 > len(data):
@@ -242,10 +280,13 @@ def parse_resource_fork(data):
 			ref_list_off = struct.unpack(">H", data[pos + 6:pos + 8])[0]
 			pos += 8
 			# The reference list is just `num_res` 12-byte entries (no
-			# leading count): offset points straight at the first entry.
+			# leading count): offset points straight at the first entry,
+			# and it must lie inside the map section.
 			rp = tl + ref_list_off
+			if num_res > MAX_MAP_RESOURCES or rp + 12 * num_res > map_offset + map_length:
+				continue
 			for _ in range(num_res):
-				if rp + 12 > len(data):
+				if rp + 12 > len(data) or len(items) >= MAX_MAP_RESOURCES:
 					break
 				res_id = struct.unpack(">h", data[rp:rp + 2])[0]
 				abs_data_off = data_offset + int.from_bytes(data[rp + 5:rp + 8], "big")
@@ -255,7 +296,10 @@ def parse_resource_fork(data):
 				length = struct.unpack(">I", data[abs_data_off:abs_data_off + 4])[0]
 				if length == 0 or length > 100000 or abs_data_off + 4 + length > len(data):
 					continue
+				if total + length > MAX_MAP_BYTES:
+					return items
 				items.append((rtype, res_id, data[abs_data_off + 4:abs_data_off + 4 + length]))
+				total += length
 		return items
 
 	def sequential():
@@ -581,7 +625,7 @@ def process_resource_fork(data, out, counts, cluts, icons, assets, scen_tags, ap
 			layo[res_id] = body
 		if plut is not None and rtype == b"plut":
 			plut[res_id] = body
-		if rtype in (b"ics8", b"ics4", b"ics#") and res_id == -16386:
+		if rtype in (b"icns", b"ics8", b"ics4", b"ics#") and res_id == -16386:
 			apple_menu.setdefault(rtype, []).append(body)
 		if rtype == b"wctb" and res_id == 0 and not wctb:
 			wctb.update(decode_wctb(body))
@@ -704,7 +748,7 @@ def collect_helper_fork(path, cluts, apple_menu, theme_icons, cursors):
 	except OSError:
 		return
 	for rtype, res_id, body in parse_resource_fork(data):
-		if rtype in (b"ics8", b"ics4", b"ics#") and res_id == -16386:
+		if rtype in (b"icns", b"ics8", b"ics4", b"ics#") and res_id == -16386:
 			apple_menu.setdefault(rtype, []).append(body)
 		elif rtype == b"clut":
 			try:
@@ -724,17 +768,6 @@ def write_apple_menu(apple_menu, cluts, out, theme_apple=None, theme_cluts=()):
 
 	Whoever supplies the icon, it decodes against the System tables
 	(the largest wins: a gray ramp would flatten the rainbow stripes)."""
-	color = None
-	mask = None
-	if apple_menu.get(b"ics8"):
-		color = apple_menu[b"ics8"][0]
-	elif apple_menu.get(b"ics4"):
-		color = apple_menu[b"ics4"][0]
-	if not color:
-		return
-	if apple_menu.get(b"ics#"):
-		_, mask_rows = macicons.decode_icn1(apple_menu[b"ics#"][0], size=16)
-		mask = mask_rows
 	# The icon decodes against the System tables even when the theme
 	# file supplies it (a scheme's own tables describe its chrome).
 	# The rainbow stripes need the fullest table: gray ramps flatten them.
@@ -743,11 +776,13 @@ def write_apple_menu(apple_menu, cluts, out, theme_apple=None, theme_cluts=()):
 	for _res_id, cols in helpers:
 		if cols and (palette is None or len(cols) > len(palette)):
 			palette = cols
-	rows = macicons.decode_icl8(color, palette, size=16) if len(color) == 256 else 		macicons.decode_icl4(color, palette, size=16) if len(color) == 128 else None
+	# The theme's own Apple menu icon (an icon suite, usually) wins, as it
+	# does for every other standard icon; the System's low-depth ics8/ics4
+	# is the fallback. One resolver for both.
+	icons = {(rtype, -16386): bodies for rtype, bodies in apple_menu.items()}
+	rows = decode_standard_icon(icons, palette, -16386, 16)
 	if rows is None:
 		return
-	if mask:
-		rows = macicons.combine_icon(rows, mask)
 	pngwrite.write_png(os.path.join(out, "apple-menu.png"), 16, 16, rows)
 	return rows
 
@@ -984,14 +1019,37 @@ def write_desktop_wallpaper(scen_tags, pictures_dir, out):
 	except OSError:
 		return False
 	os.makedirs(os.path.join(out, "wallpapers"), exist_ok=True)
+	# Recognise the picture formats a Mac OS 9 Desktop Pictures folder can
+	# hold. Anything but PNG is converted by the Theme Installer when it
+	# installs: the desktop loads wallpapers as PNG.
 	if data[:2] == b"\xff\xd8":
-		with open(os.path.join(out, "wallpapers", "desktop-wallpaper.jpg"), "wb") as f:
+		ext = "jpg"
+	elif data[:8] == b"\x89PNG\r\n\x1a\n":
+		ext = "png"
+	elif data[:6] in (b"GIF87a", b"GIF89a"):
+		ext = "gif"
+	elif data[:4] in (b"II*\x00", b"MM\x00*"):
+		ext = "tif"
+	elif data[:2] == b"BM":
+		ext = "bmp"
+	else:
+		ext = None
+	if ext:
+		with open(os.path.join(out, "wallpapers", "desktop-wallpaper." + ext), "wb") as f:
 			f.write(data)
 		return True
-	if data[:8] == b"\x89PNG\r\n\x1a\n":
-		with open(os.path.join(out, "wallpapers", "desktop-wallpaper.png"), "wb") as f:
-			f.write(data)
-		return True
+	# A PICT whose picture is the data fork (no .rsrc companion): the
+	# 512-byte PICT file header precedes the same opcodes a resource body
+	# holds, so try the body with and without it.
+	for body in ([data[512:]] if len(data) > 512 else []) + [data]:
+		try:
+			w, h, rows = macpict.decode_pict(body)
+		except (ValueError, IndexError, struct.error):
+			continue
+		if w >= WALLPAPER_MIN_SIDE and h >= WALLPAPER_MIN_SIDE:
+			pngwrite.write_png(os.path.join(out, "wallpapers", "desktop-wallpaper.png"),
+				w, h, rows)
+			return True
 	rsrc = os.path.join(os.path.dirname(found), ".rsrc", name)
 	try:
 		with open(rsrc, "rb") as f:
@@ -1244,6 +1302,29 @@ def write_theme_chrome(name, pxm, ppats, out, cluts=(), layo=None, plut=None):
 		pngwrite.write_argb(os.path.join(chrome_dir, key + ".argb"), rows)
 		keys[key] = "chrome/" + key + ".argb"
 
+	def save_bar(key, rows, height):
+		"""Save a title-bar tile cropped to the bar band.
+
+		The frame layout's end caps and middle come from different
+		resources, and a cap can carry transparent rows above the bar (or
+		the window frame below it). Drawn from row 0, such a cap looks
+		shorter than the middle. Start every tile at the first row that
+		has ink and keep the middle's height, repeating the last row when
+		the art is shorter."""
+		if not rows or not rows[0]:
+			return
+		top = 0
+		for y, row in enumerate(rows):
+			if any(px[3] for px in row):
+				top = y
+				break
+		rows = rows[top:top + height]
+		if not rows:
+			return
+		while len(rows) < height:
+			rows.append(list(rows[-1]))
+		save_tile(key, rows)
+
 	# 1. Universal Kaleidoscope title-bar buttons (200 close, 210 collapse, 220 zoom).
 	has_any_btn = any(pid in pxm for pid in (200, 210, 220))
 	if has_any_btn and (layo or name in THEME_CHROME):
@@ -1298,9 +1379,10 @@ def write_theme_chrome(name, pxm, ppats, out, cluts=(), layo=None, plut=None):
 					(r for r in recs[2:] if r[0] == b"pxm#" and (r[1] & 0xFFFF) in (6178, 6134, 6278)),
 					recs[2]))
 			right_rows = resolve_rec(right_rec[0], right_rec[1], layer)
-			save_tile("bar-left" + suffix, left_rows)
-			save_tile("bar-middle" + suffix, mid_rows)
-			save_tile("bar-right" + suffix, right_rows)
+			bar_h = len(mid_rows)
+			save_bar("bar-left" + suffix, left_rows, bar_h)
+			save_bar("bar-middle" + suffix, mid_rows, bar_h)
+			save_bar("bar-right" + suffix, right_rows, bar_h)
 			mids_by_suffix[suffix] = mid_rows
 
 		# 2b. Two-part bars: the title group rides a pinstripe patch on
@@ -1401,9 +1483,10 @@ def write_theme_chrome(name, pxm, ppats, out, cluts=(), layo=None, plut=None):
 			right_rows = resolve_rec(right_rec[0], right_rec[1], layer) if right_rec else None
 			if not right_rows:
 				right_rows = dialog_side(recs, layer, True)
-			save_tile("bar-dialog-left" + suffix, left_rows)
-			save_tile("bar-dialog-middle" + suffix, mid_rows)
-			save_tile("bar-dialog-right" + suffix, right_rows)
+			bar_h = len(mid_rows)
+			save_bar("bar-dialog-left" + suffix, left_rows, bar_h)
+			save_bar("bar-dialog-middle" + suffix, mid_rows, bar_h)
+			save_bar("bar-dialog-right" + suffix, right_rows, bar_h)
 
 		for short, pid in (("dialog-close", 6185), ("dialog-zoom", 211), ("dialog-grow", 221)):
 			bodies = pxm.get(pid)
@@ -1849,13 +1932,17 @@ def main():
 			# file held artwork itself: an artless file stays refused
 			# even with a System file present. The theme file's own
 			# entries, if any, stay first and win.
-			system = find_mac_file(filepath, "System")
+			system = args.system or find_mac_file(filepath, "System")
 			if system:
 				collect_helper_fork(system, cluts, apple_menu, theme_icons, cursors)
 				fonts = fonts_dir_for(system)
 				if fonts:
 					collect_fonts_dir(fonts, assets)
-			finder = find_mac_file(filepath, "Finder")
+			# The Finder sits beside the System file, at the same level
+			# (or under the same .rsrc folder); it holds the desktop's
+			# volume icons.
+			finder = (find_mac_file(system, "Finder") if system else None) or \
+				find_mac_file(filepath, "Finder")
 			if finder:
 				collect_helper_fork(finder, cluts, apple_menu, theme_icons, cursors)
 	else:
@@ -2009,6 +2096,14 @@ def main():
 	with open(os.path.join(out, "theme.conf"), "w") as f:
 		f.write("name=%s\n" % (name or scen_name or "Mac OS 9 Theme"))
 		f.write("source=%s\n" % src)
+		# The Appearance panel rebuilds a bundle whose extractor has
+		# changed, so an updated ZacOS fills in assets an older one
+		# could not decode.
+		try:
+			with open(os.path.abspath(__file__), "rb") as _self:
+				f.write("extractor-sha256=%s\n" % hashlib.sha256(_self.read()).hexdigest())
+		except OSError:
+			pass
 		accent = args.accent or auto_accent
 		highlight = args.highlight or scen_highlight or auto_highlight
 		pattern = args.pattern

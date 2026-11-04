@@ -58,10 +58,13 @@ int main(int argc, char **argv) {
 	// Two printers: Laser (stopped once cupsdisable runs) and Inkjet.
 	put(st + "/default", "Laser");
 	put(st + "/Laser.state", "3");
-	put(st + "/jobs", "7,pending,\"Letter, \\\\\\\"draft\\\\\\\"\",adam,12,0,1792026828\n"
-		"8,pending-held,Photo.png,adam,300,0,1792026900\n");
+	put(st + "/jobs", "7,pending,\"Letter, \\\\\\\"draft\\\\\\\"\",adam,12,0,1792026828,none\n"
+		"8,pending-held,Photo.png,adam,300,0,1792026900,job-hold-until-specified\n");
 	const QString sh = "#!/bin/sh\nS='" + st + "'\necho \"$(basename $0) $*\" >> '" + log + "'\n";
-	put(bin + "/lpstat", sh + "case $1 in -e) printf 'Inkjet\\nLaser\\nBrowsed\\nGhost\\n' ;; -p) "
+	put(bin + "/lpstat", sh + "case $1 in -e) if [ -f \"$S/down\" ]; then "
+		"echo 'lpstat: Unable to connect to server' >&2; exit 1; fi; "
+		"if [ -f \"$S/none\" ]; then echo 'lpstat: No destinations added.' >&2; exit 1; fi; "
+		"printf 'Inkjet\\nLaser\\nBrowsed\\nGhost\\nWiFi\\nWiFiUsb\\n' ;; -p) "
 		"printf 'printer Inkjet is idle. enabled since Mon\\nprinter Laser is stopped. enabled since Mon\\n' ;; -d) "
 		"printf 'system default destination: %s\\n' \"$(cat $S/default)\" ;; esac\n", true);
 	put(bin + "/lpoptions", sh + "case $1 in\n"
@@ -70,11 +73,18 @@ int main(int argc, char **argv) {
 		"printer-make-and-model='Laser Co L1' printer-state=$(cat $S/Laser.state) printer-is-accepting-jobs=true "
 		"printer-state-reasons=none\"; elif [ \"$2\" = Browsed ]; then echo \"printer-info='Old Queue' "
 		"device-uri=implicitclass://Canon/ printer-state=3 printer-is-accepting-jobs=true "
-		"printer-state-reasons=none\"; else echo \"printer-info='Inkjet' printer-state=3 printer-is-temporary=true "
+		"printer-state-reasons=none\"; elif [ \"$2\" = WiFi ]; then echo \"printer-info='Canon TS8300 (Wi-Fi)' "
+		"printer-make-and-model='Canon TS8300 series' device-uri=ipps://Canon._ipps._tcp.local/\"; "
+		"elif [ \"$2\" = WiFiUsb ]; then echo \"printer-info='Canon TS8300 (USB)' "
+		"printer-make-and-model='Canon TS8300 series' device-uri=ipp://Canon._ipp._tcp.local/\"; "
+		"else echo \"printer-info='Inkjet' printer-state=3 printer-is-temporary=true "
 		"printer-state-reasons=media-empty-error\"; fi ;;\nesac\n", true);
 	put(bin + "/ipptool", sh + "echo job-id,job-state,job-name,job-originating-user-name,job-k-octets,"
-		"job-impressions-completed,time-at-creation\ncat $S/jobs\n", true);
-	put(bin + "/lp", sh + "if [ \"$1\" = -i ]; then id=${2##*-}; "
+		"job-impressions-completed,time-at-creation,job-state-reasons\ncat $S/jobs\n", true);
+	put(bin + "/lp", sh + "case \"$*\" in *bad.pdf*) "
+		"echo 'lp: Error - The printer is not responding.' >&2; "
+		"echo 'lp: Check the printer connection.' >&2; exit 1;; esac\n"
+		"if [ \"$1\" = -i ]; then id=${2##*-}; "
 		"if [ \"$4\" = resume ]; then sed -i \"s/^$id,pending-held,/$id,pending,/\" $S/jobs; "
 		"else sed -i \"s/^$id,pending,/$id,pending-held,/\" $S/jobs; fi; exit 0; fi\n"
 		"echo \"request id is $2-42 (1 file(s))\"\n", true);
@@ -116,9 +126,65 @@ int main(int argc, char **argv) {
 	check(jobs.size() == 2 && jobs[0].title == "Test, \"quoted\" job" && jobs[0].held() &&
 		jobs[0].owner == "adam" && jobs[0].created == 1792026828 && jobs[1].status() == "Printing page 3",
 		"ipptool's jobs: quoting undone, states in words");
+	const QList<PrintJob> stoppedJobs = parseJobs(
+		"job-id,job-state,job-state-reasons\n5,processing-stopped,media-needed-error\n");
+	check(stoppedJobs.size() == 1 && stoppedJobs[0].status() == "Stopped (media needed)",
+		"a stopped document says why");
 	check(parseJobId("request id is Laser-12 (1 file(s))\n") == 12 && parseJobId("nonsense") == 0, "lp's job id");
 	check(isBrowsedQueue("implicitclass://Canon/") && !isBrowsedQueue("ipp://printer/ipp/print") &&
 		!isBrowsedQueue(""), "cups-browsed's queues by their device-uri");
+
+	// ---- one printer over several connections
+	const auto connection = [](const QString &name, const QString &info, const QString &model,
+		const QString &uri, bool temporary, bool discovered) {
+		Printer p;
+		p.name = name;
+		p.info = info;
+		p.model = model;
+		p.uri = uri;
+		p.temporary = temporary;
+		p.discovered = discovered;
+		return p;
+	};
+	Printer usb = connection("Usb", "Office Laser", "Laser Co L1, driverless, cups-filters 1.28.17",
+		"usb://Laser/1", false, false);
+	Printer wifi = connection("Wifi", "Office Laser", "Laser Co L1",
+		"ipps://laser._ipps._tcp.local/", true, true);
+	Printer wifiUsb = connection("WifiUsb", "Office Laser (USB)", "Laser Co L1",
+		"ipp://laser._ipp._tcp.local/", true, true);
+	Printer other = connection("Other", "Other Printer", "Other Co", "usb://Other/1", false, false);
+	{
+		const QList<QList<Printer>> groups = printerGroups({ usb, wifi, wifiUsb, other });
+		check(groups.size() == 2 && groups[0].size() == 3 && groups[0][0].name == "Usb" &&
+			groups[1].size() == 1 && groups[1][0].name == "Other",
+			"one entry per printer, with its set-up connection first");
+		wifi.isDefault = true;
+		const QList<QList<Printer>> chosen = printerGroups({ usb, wifi, wifiUsb });
+		check(chosen.size() == 1 && chosen[0][0].name == "Wifi",
+			"the connection already chosen is kept");
+		wifi.isDefault = false;
+		usb.state = 5;
+		const QList<QList<Printer>> stopped = printerGroups({ usb, wifi, wifiUsb });
+		check(stopped.size() == 1 && stopped[0][0].name == "Wifi",
+			"a stopped connection gives way to one that answers");
+		usb.state = 3;
+		const Printer usb2 = connection("Usb2", "Office Laser 2", "Laser Co L1",
+			"usb://Laser/2", false, false);
+		const QList<QList<Printer>> sameModel = printerGroups({ usb, usb2, wifi, wifiUsb });
+		check(sameModel.size() == 3, "two printers of one model don't swallow each other's connections");
+	}
+	{
+		const Printer plain = connection("One", "Printer", "", "ipps://one._ipps._tcp.local/", true, true);
+		const Printer twin = connection("OneUsb", "Printer (USB)", "", "ipp://one._ipp._tcp.local/", true, true);
+		const QList<QList<Printer>> groups = printerGroups({ twin, plain });
+		check(groups.size() == 1 && groups[0][0].name == "One",
+			"connections with no model are matched by their name");
+	}
+	{
+		const Printer raw = connection("Raw", "Raw Printer", "Local Raw Printer", "usb://Raw/1", false, false);
+		const Printer found = connection("Found", "Raw Printer", "Local Raw Printer", "ipp://raw/ipp/print", true, true);
+		check(printerGroups({ raw, found }).size() == 2, "a generic model doesn't merge printers");
+	}
 	check(parsePrinterNames("Inkjet\nLaser\n") == QStringList({ "Inkjet", "Laser" }) &&
 		parseDefaultPrinter("system default destination: Laser\n") == "Laser" &&
 		parseDefaultPrinter("no system default destination\n").isEmpty(), "lpstat's printers and default");
@@ -144,11 +210,23 @@ int main(int argc, char **argv) {
 	put(dir.path() + "/c.odt", "PK\x03\x04");
 	check(canPrintDirectly(dir.path() + "/a.pdf") && canPrintDirectly(dir.path() + "/b.txt") &&
 		!canPrintDirectly(dir.path() + "/c.odt"), "PDF and text print directly; office documents don't");
+	{
+		put(dir.path() + "/bad.pdf", "%PDF-1.4\n");
+		QString partialError;
+		const QList<int> partial = printFiles("Laser",
+			{ dir.path() + "/a.pdf", dir.path() + "/bad.pdf" }, &partialError);
+		check(partial.size() == 1 && partialError.contains("bad.pdf") &&
+			partialError.contains("Check the printer connection"),
+			"one document failing doesn't stop the rest, and the error names it");
+	}
 
 	// ---- asking CUPS (the stand-ins)
 	const QList<Printer> printers = listPrinters();
-	check(printers.size() == 2 && printers[1].name == "Laser" && printers[1].isDefault && !printers[0].isDefault &&
+	check(printers.size() == 4 && printers[1].name == "Laser" && printers[1].isDefault && !printers[0].isDefault &&
 		printers[0].temporary && printers[1].location == "Back room", "the printers, the default marked");
+	check(printers[2].name == "WiFi" && printers[2].temporary &&
+		printers[2].shownName() == "Canon TS8300 (Wi-Fi)" && printers[2].uri.startsWith("ipps://"),
+		"a printer CUPS found on the network is listed");
 	bool browsedShown = false;
 	for (const Printer &q : printers) {
 		browsedShown = browsedShown || q.name == "Browsed";
@@ -161,8 +239,8 @@ int main(int argc, char **argv) {
 	PickerWindow picker;
 	picker.show();
 	settle();
-	check(picker.rows() == QStringList({ "Inkjet", "Office Laser" }) && picker.selectedRow() == 1,
-		"Printer Picker lists them, your printer selected");
+	check(picker.rows() == QStringList({ "Inkjet", "Office Laser", "Canon TS8300 (Wi-Fi)" }) &&
+		picker.selectedRow() == 1, "Printer Picker lists them, your printer selected");
 	check(picker.details().contains("Location: Back room") && picker.details().contains("Status: Idle"),
 		"and says where and how it is");
 	picker.pick(0);
@@ -173,6 +251,14 @@ int main(int argc, char **argv) {
 	const QString deskPrinter = picker.createDesktopPrinterForSelected();
 	check(deskPrinter == desk + "/Inkjet.printer" && desktopPrinterQueue(deskPrinter) == "Inkjet",
 		"Create Desktop Printer puts it on the desktop");
+	picker.pick(2);
+	settle();
+	check(read(st + "/default") == "WiFi" && picker.selectedRow() == 2 &&
+		picker.details().contains("Found on the network") &&
+		picker.details().contains("Model: Canon TS8300 series"),
+		"a printer found on the network can be chosen, and says it will be set up on first print");
+	check(picker.rows().size() == 3 && picker.details().contains("Also available: Canon TS8300 (USB)."),
+		"its USB connection is one row, named in the details");
 
 	QueueWindow queue("Laser");
 	queue.show();
@@ -206,5 +292,12 @@ int main(int argc, char **argv) {
 	check(read(log).contains("lp -d Laser -t a.pdf -- " + dir.path() + "/a.pdf") &&
 		!read(log).contains("c.odt") && alerts == before + 1,
 		"dropped documents print there; one that can't is explained");
+	put(st + "/down", "1");
+	check(listPrinters().isEmpty() && cupsProblem().contains("isn't running"),
+		"a printing service that isn't running is said plainly");
+	QFile::remove(st + "/down");
+	put(st + "/none", "1");
+	check(listPrinters().isEmpty() && cupsProblem().isEmpty(),
+		"CUPS with no printers is not a failure");
 	return fails ? 1 : 0;
 }

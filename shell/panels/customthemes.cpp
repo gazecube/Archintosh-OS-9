@@ -5,6 +5,8 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
@@ -85,6 +87,17 @@ static bool themeCompanionExists(const QFileInfo &file) {
  * and its folder still holds a preset: an installed theme is never
  * imported twice, while a re-dropped folder whose preset was deleted
  * regenerates it. */
+/* The extractor's own SHA-256: a bundle records it when it is built, so a
+ * ZacOS update that can decode more than the old one rebuilds the bundle
+ * instead of keeping what the old extractor could not fill in. */
+static QString extractorHash() {
+	QFile f(themeExtractorPath());
+	if (!f.open(QIODevice::ReadOnly)) {
+		return QString();
+	}
+	return QString::fromLatin1(QCryptographicHash::hash(f.readAll(), QCryptographicHash::Sha256).toHex());
+}
+
 static bool themeSourceImported(const QString &fork) {
 	if (fork.isEmpty()) {
 		return false;
@@ -93,6 +106,7 @@ static bool themeSourceImported(const QString &fork) {
 	if (QDir(forkDir).entryInfoList(QStringList("*.json"), QDir::Files).isEmpty()) {
 		return false;
 	}
+	const QString want = extractorHash();
 	const QString root = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) +
 		"/zacos9/themes";
 	for (const QFileInfo &bundle : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
@@ -101,12 +115,21 @@ static bool themeSourceImported(const QString &fork) {
 			continue;
 		}
 		QTextStream in(&conf);
-		QString line;
+		QString line, source, hash;
 		while (in.readLineInto(&line)) {
-			if (line == "source=" + fork) {
-				return true;
+			if (line.startsWith("source=")) {
+				source = line.mid(7);
+			} else if (line.startsWith("extractor-sha256=")) {
+				hash = line.mid(17);
 			}
 		}
+		if (source != fork) {
+			continue;
+		}
+		if (!want.isEmpty() && hash != want) {
+			continue; /* built by an older extractor: import again */
+		}
+		return true;
 	}
 	return false;
 }
@@ -457,6 +480,18 @@ static void sweepCompanionBundles() {
 
 class Catalog : public QObject {
 public:
+	~Catalog() override {
+		/* Closing the Appearance panel while the catalogue helper runs
+		 * would otherwise destroy a running QProcess. */
+		if (process.state() != QProcess::NotRunning) {
+			process.kill();
+			QElapsedTimer timer;
+			timer.start();
+			while (process.state() != QProcess::NotRunning && timer.elapsed() < 1000) {
+				QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 10);
+			}
+		}
+	}
 	QList<Theme> sounds{{ "none", "None", {} }, { "original", "ZacOS Original", {} }};
 	QList<Theme> presets{{ "platinum", "Silver Coat", {
 		{ "accent", "" }, { "highlight", "" }, { "pattern", "" },
@@ -1072,9 +1107,67 @@ void previewSoundTheme(int index) {
 		const QString path = QString::fromUtf8(pl_data_dir()) + "/sounds/woodblock.wav";
 		pl_sound_preview(path.toUtf8().constData(), level);
 	} else if (!theme.values.isEmpty()) {
-		const QString path = cacheFolder() + "/" + theme.values.first();
+		/* The first key alphabetically is button-click, so previewing a
+		 * set played a click and sounded broken. Use an event that says
+		 * what the set is like. */
+		QString file = theme.values.value("sound.window-open");
+		if (file.isEmpty()) {
+			file = theme.values.value("sound.menu-command");
+		}
+		if (file.isEmpty()) {
+			file = theme.values.value("sound.startup");
+		}
+		if (file.isEmpty()) {
+			file = theme.values.first();
+		}
+		const QString path = cacheFolder() + "/" + file;
 		pl_sound_preview(path.toUtf8().constData(), level);
 	}
+}
+
+/* The catalog's id for an installed picture: the prefix, the SHA-256 of
+ * the file's name, then "image" (see zacos9-patterns). */
+static QString catalogImageId(const char *prefix, const QString &fileName) {
+	return QString::fromLatin1(prefix) + ":" + QString::fromLatin1(
+		QCryptographicHash::hash(fileName.toUtf8(), QCryptographicHash::Sha256).toHex()) + ":image";
+}
+
+/* A preset may name a pattern or picture by its installed file stem
+ * ("Paper-pattern-1"), as presets made before the catalog did. The
+ * compositor resolves only catalog ids, so choosing such a theme changed
+ * nothing on the desktop and it looked unselectable. */
+static QString resolvedPatternId(const QString &id) {
+	for (int i = 0; i < desktopPatternCount(); ++i) {
+		if (desktopPatternId(i) == id) {
+			return id;
+		}
+	}
+	for (int i = 0; i < desktopPatternCount(); ++i) {
+		if (desktopPatternName(i).startsWith(id + ".")) {
+			return desktopPatternId(i);
+		}
+	}
+	for (const QString &file : QDir(desktopPatternsFolder()).entryList({ id + ".*" }, QDir::Files)) {
+		return catalogImageId("user", file);
+	}
+	return id;
+}
+
+static QString resolvedWallpaperId(const QString &id) {
+	for (int i = 0; i < desktopWallpaperCount(); ++i) {
+		if (desktopWallpaperId(i) == id) {
+			return id;
+		}
+	}
+	for (int i = 0; i < desktopWallpaperCount(); ++i) {
+		if (desktopWallpaperName(i).startsWith(id + ".")) {
+			return desktopWallpaperId(i);
+		}
+	}
+	for (const QString &file : QDir(desktopWallpaperFolder()).entryList({ id + ".*" }, QDir::Files)) {
+		return catalogImageId("wallpaper", file);
+	}
+	return id;
 }
 
 bool applyAppearanceTheme(int index, QString *error) {
@@ -1112,28 +1205,39 @@ bool applyAppearanceTheme(int index, QString *error) {
 		*error = "The theme specifies an unknown wallpaper placement.";
 		return false;
 	}
-	if (!values.value("pattern").isEmpty() && !desktopPatternAvailable(values["pattern"])) {
-		*error = "The preset's desktop pattern is missing.";
-		return false;
-	}
-	if (!values.value("wallpaper").isEmpty() && !desktopWallpaperAvailable(values["wallpaper"])) {
-		*error = "The preset's wallpaper is missing.";
-		return false;
-	}
-	if (values.contains("alert-sound") && !values["alert-sound"].isEmpty() && values["alert-sound"] != "none") {
-		const QString id = values["alert-sound"];
-		if (!alertSoundAvailable(id)) {
-			*error = "The preset's alert sound is missing.";
-			return false;
+	/* A theme is more than any one optional piece of art. When a sound
+	 * set, font, alert or desktop picture cannot be found, leave that
+	 * choice out and say so, rather than refusing the whole theme: an
+	 * undecodable sound set used to make the theme unselectable. */
+	QStringList missing;
+	if (!values.value("pattern").isEmpty()) {
+		if (desktopPatternAvailable(values["pattern"])) {
+			values["pattern"] = resolvedPatternId(values["pattern"]);
+		} else {
+			missing << "desktop pattern";
+			values["pattern"] = "";
 		}
+	}
+	if (!values.value("wallpaper").isEmpty()) {
+		if (desktopWallpaperAvailable(values["wallpaper"])) {
+			values["wallpaper"] = resolvedWallpaperId(values["wallpaper"]);
+		} else {
+			missing << "desktop picture";
+			values["wallpaper"] = "";
+		}
+	}
+	if (values.contains("alert-sound") && !values["alert-sound"].isEmpty() && values["alert-sound"] != "none" &&
+			!alertSoundAvailable(values["alert-sound"])) {
+		missing << "alert sound";
+		values["alert-sound"] = "";
 	}
 	if (!values.value("font-family").isEmpty() &&
 			!QFontDatabase::families().contains(values["font-family"]) &&
 			!themeFontFamilies().contains(values["font-family"])) {
-		*error = "The preset's program font is missing.";
-		return false;
+		missing << "program font " + values["font-family"];
+		values["font-family"] = "";
 	}
-	if (values.contains("sound-theme")) {
+	if (values.contains("sound-theme") && !values["sound-theme"].isEmpty()) {
 		int sound = -1;
 		for (int i = 0; i < soundThemeCount(); ++i) {
 			if (soundThemeId(i) == values["sound-theme"]) {
@@ -1142,18 +1246,25 @@ bool applyAppearanceTheme(int index, QString *error) {
 			}
 		}
 		if (sound < 0) {
-			*error = "The preset's sound theme is missing.";
-			return false;
-		}
-		for (const QString &event : events) {
-			values.insert("sound." + event, "");
-		}
-		for (auto it = catalog().sounds[sound].values.cbegin(); it != catalog().sounds[sound].values.cend(); ++it) {
-			values.insert(it.key(), it.value());
+			missing << "sound set";
+			values["sound-theme"] = "";
+		} else {
+			for (const QString &event : events) {
+				values.insert("sound." + event, "");
+			}
+			for (auto it = catalog().sounds[sound].values.cbegin(); it != catalog().sounds[sound].values.cend(); ++it) {
+				values.insert(it.key(), it.value());
+			}
 		}
 	}
 	values.insert("appearance-theme", preset.id);
-	return writeSettings(values, error);
+	if (!writeSettings(values, error)) {
+		return false;
+	}
+	if (!missing.isEmpty()) {
+		*error = "Applied " + preset.name + " without its " + missing.join(", ") + ".";
+	}
+	return true;
 }
 
 bool saveAppearanceTheme(const QString &name, QString *error) {

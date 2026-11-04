@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QImage>
 #include <QKeyEvent>
 #include <QTemporaryDir>
 #include <QThread>
@@ -12,6 +13,7 @@
 #include <functional>
 
 #include "customthemes.h"
+#include "custompatterns.h"
 #include "appearance.h"
 #include "settings.h"
 
@@ -119,10 +121,21 @@ int main(int argc, char **argv) {
 	const QString custom = soundThemesFolder() + "/Original Test";
 	assert(QDir().mkpath(custom));
 	assert(QFile::copy(QString::fromUtf8(argv[1]), custom + "/click.wav"));
+	/* A second, distinct sample for window-open, so the preview can be
+	 * checked to play that event rather than button-click. */
+	QFile sample(QString::fromUtf8(argv[1]));
+	assert(sample.open(QIODevice::ReadOnly));
+	QByteArray windowOpen = sample.readAll();
+	sample.close();
+	const int data = windowOpen.indexOf("data");
+	assert(data > 0 && data + 9 < windowOpen.size());
+	windowOpen[data + 9] = char(windowOpen[data + 9] ^ 0x01);
+	write(custom + "/open.wav", windowOpen);
 	write(custom + "/theme.json", R"JSON({"version":1,"name":"Original Test",
 		"events":{"button-click":"click.wav","checkbox-toggle":"click.wav",
 		"window-collapse":"click.wav","window-expand":"click.wav",
 		"window-drag":"click.wav","window-drag-end":"click.wav",
+		"window-open":"open.wav",
 		"startup":"click.wav","shutdown":"click.wav"}})JSON");
 	assert(waitFor([] { return soundThemeCount() == 3; }));
 	assert(changes > 0);
@@ -159,10 +172,9 @@ int main(int argc, char **argv) {
 	assert(!preference("sound.button-click").isEmpty());
 	for (const char *key : { "sound.window-collapse", "sound.window-expand",
 			"sound.window-drag", "sound.window-drag-end", "sound.startup",
-			"sound.shutdown" }) {
+			"sound.shutdown", "sound.window-open" }) {
 		assert(!preference(key).isEmpty());
 	}
-	assert(preference("sound.window-open").isEmpty());
 	write(root.path() + "/pw-play", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_LOG\"\nsleep 0.4\n");
 	QFile player(root.path() + "/pw-play");
 	assert(player.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
@@ -198,6 +210,14 @@ int main(int argc, char **argv) {
 	assert(log.open(QIODevice::ReadOnly));
 	assert(log.readAll().count('\n') == 1);
 	log.close();
+	assert(QFile::remove(root.path() + "/played"));
+	/* Preview plays the set's window-open, not its button-click. */
+	previewSoundTheme(2);
+	assert(waitFor([&] {
+		QFile playback(root.path() + "/played");
+		return playback.open(QIODevice::ReadOnly) &&
+			playback.readAll().contains(preference("sound.window-open").toUtf8());
+	}));
 	assert(QFile::remove(root.path() + "/played"));
 	assert(pl_setting_set("interface-volume", "0"));
 	previewSoundTheme(2);
@@ -243,8 +263,8 @@ int main(int argc, char **argv) {
 	assert(applySoundTheme(2, &error));
 	assert(QFile::remove(appearanceThemesFolder() + "/bundled.json"));
 	assert(waitFor([] { return appearanceThemeCount() == 2; }));
-	/* A preset without a program font drops the previous one, and a
-	 * preset naming a missing font is refused. */
+	/* A preset without a program font drops the previous one; one naming
+	 * a missing font still applies, without the font and with a note. */
 	assert(pl_setting_set("font-family", "Stale Font"));
 	assert(applyAppearanceTheme(0, &error));
 	assert(preference("font-family").isEmpty());
@@ -257,8 +277,25 @@ int main(int argc, char **argv) {
 			badfont = i;
 		}
 	}
-	assert(badfont >= 0 && !applyAppearanceTheme(badfont, &error) && error.contains("font"));
+	assert(badfont >= 0 && applyAppearanceTheme(badfont, &error));
+	assert(error.contains("font") && preference("font-family").isEmpty());
 	assert(QFile::remove(appearanceThemesFolder() + "/badfont.json"));
+	assert(waitFor([] { return appearanceThemeCount() == 2; }));
+	/* A preset whose sound set the catalogue could not decode (Drawing
+	 * Board's) still applies: one missing piece of art must not make the
+	 * theme unselectable. */
+	write(appearanceThemesFolder() + "/badsound.json",
+		R"JSON({"version":1,"name":"BadSound","settings":{"sound-theme":"user:00000000000000000000000000000000"}})JSON");
+	assert(waitFor([] { return appearanceThemeCount() == 3; }));
+	int badsound = -1;
+	for (int i = 0; i < appearanceThemeCount(); ++i) {
+		if (appearanceThemeName(i) == "BadSound") {
+			badsound = i;
+		}
+	}
+	assert(badsound >= 0 && applyAppearanceTheme(badsound, &error));
+	assert(error.contains("sound set") && preference("sound-theme").isEmpty());
+	assert(QFile::remove(appearanceThemesFolder() + "/badsound.json"));
 	assert(waitFor([] { return appearanceThemeCount() == 2; }));
 	assert(applySoundTheme(2, &error));
 	/* Dropping a Mac OS 9 theme file into Appearance > Theme Files files
@@ -323,7 +360,20 @@ int main(int argc, char **argv) {
 	write(legacy + "/Old", makeThemeFork());
 	const QString oldBundle = root.path() + "/config/zacos9/themes/Old";
 	assert(QDir().mkpath(oldBundle));
-	write(oldBundle + "/theme.conf", QByteArray("source=" + legacy.toUtf8() + "/Old\nname=Old\n"));
+	/* The old bundle records the extractor that built it; the panel only
+	 * rebuilds a bundle that an older extractor made. */
+	QByteArray extractor;
+	QFile aquaConf(bundle + "/theme.conf");
+	if (aquaConf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+		for (const QByteArray &line : aquaConf.readAll().split('\n')) {
+			if (line.startsWith("extractor-sha256=")) {
+				extractor = line + "\n";
+			}
+		}
+	}
+	assert(!extractor.isEmpty());
+	write(oldBundle + "/theme.conf",
+		QByteArray("source=" + legacy.toUtf8() + "/Old\nname=Old\n") + extractor);
 	write(legacy + "/oldpreset.json",
 		R"JSON({"version":1,"name":"OldSaved","settings":{"theme-bundle":"Old"}})JSON");
 	const QString oldFolder = appearanceThemesFolder() + "/Old";
@@ -378,11 +428,52 @@ int main(int argc, char **argv) {
 	assert(waitFor([] { return !customThemeErrors().isEmpty(); }));
 	assert(QFile::remove(custom + "/theme.json"));
 	assert(QFile::remove(custom + "/click.wav"));
+	assert(QFile::remove(custom + "/open.wav"));
 	assert(QDir().rmdir(custom));
 	assert(waitFor([] { return soundThemeCount() == 2; }));
 	assert(preference("sound-theme") == id);
 	assert(preference("sound.button-click").isEmpty());
 	assert(!applySoundTheme(2, &error));
+
+	/* A preset from before the catalog names its pattern by the installed
+	 * file ("Old-pattern-1"), which the compositor cannot resolve: applying
+	 * it must store the catalog id instead, or the theme seems to do
+	 * nothing and cannot really be selected. */
+	{
+		const QString folder = desktopPatternsFolder();
+		assert(QDir().mkpath(folder));
+		QImage tile(2, 2, QImage::Format_ARGB32);
+		tile.fill(QColor(0x40, 0x80, 0xc0));
+		assert(tile.save(folder + "/Old-pattern-1.png", "PNG"));
+		const QString path = appearanceThemesFolder() + "/old-pattern.json";
+		write(path, R"JSON({"version":1,"name":"Old Pattern","settings":{"pattern":"Old-pattern-1"}})JSON");
+		assert(waitFor([&] {
+			for (int i = 0; i < appearanceThemeCount(); ++i) {
+				if (appearanceThemeName(i) == "Old Pattern") {
+					return true;
+				}
+			}
+			return false;
+		}));
+		int oldPattern = -1;
+		for (int i = 0; i < appearanceThemeCount(); ++i) {
+			if (appearanceThemeName(i) == "Old Pattern") {
+				oldPattern = i;
+			}
+		}
+		assert(oldPattern >= 0 && applyAppearanceTheme(oldPattern, &error));
+		const QString resolved = preference("pattern");
+		assert(resolved.startsWith("user:") && resolved.endsWith(":image"));
+		assert(QFile::remove(path));
+		/* Let the catalogue notice the removal and its helper finish
+		 * before the test ends. */
+		QElapsedTimer settle;
+		settle.start();
+		while (settle.elapsed() < 800) {
+			QApplication::processEvents();
+			QThread::msleep(20);
+		}
+	}
 
 	/* Smart Scrolling for GTK 3: a marked block in the user's gtk.css,
 	 * added and taken out without touching what else is there. */
